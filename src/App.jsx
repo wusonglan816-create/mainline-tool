@@ -32,6 +32,24 @@ function splitLines(content = '') {
   return content === '' ? [] : content.split('\n');
 }
 
+async function readJsonResponse(res, fallbackMessage) {
+  const contentType = res.headers.get('content-type') || '';
+  const rawText = await res.text();
+
+  if (!contentType.includes('application/json')) {
+    if (rawText.startsWith('<!DOCTYPE') || rawText.startsWith('<html')) {
+      throw new Error('当前页面没有连到正确的后端服务，请重启前后端后重试');
+    }
+    throw new Error(fallbackMessage);
+  }
+
+  return JSON.parse(rawText || '{}');
+}
+
+function isBlankLine(line = '') {
+  return line.trim() === '';
+}
+
 function getChangedSegments(currentText = '', otherText = '') {
   if (currentText === otherText) {
     return [{ text: currentText, changed: false }];
@@ -108,7 +126,10 @@ function buildDiffRows(leftContent = '', rightContent = '') {
       i + 1 < leftLen &&
       j + 1 < rightLen &&
       leftLines[i + 1] === rightLines[j + 1] &&
-      getLineSimilarity(leftLines[i], rightLines[j]) >= 0.45
+      (
+        getLineSimilarity(leftLines[i], rightLines[j]) >= 0.45 ||
+        isBlankLineReplacement(leftLines[i], rightLines[j])
+      )
     ) {
       rows.push({
         type: 'changed',
@@ -222,7 +243,13 @@ function isCommentLine(line = '') {
 function getLineSimilarity(leftText = '', rightText = '') {
   const left = leftText.trim();
   const right = rightText.trim();
-  if (!left || !right || isCommentLine(left) || isCommentLine(right)) {
+  if (!left || !right) {
+    return 0;
+  }
+
+  const leftIsComment = isCommentLine(left);
+  const rightIsComment = isCommentLine(right);
+  if (leftIsComment !== rightIsComment) {
     return 0;
   }
 
@@ -255,6 +282,10 @@ function getLineSimilarity(leftText = '', rightText = '') {
   const suffixScore = suffix / Math.max(left.length, right.length);
 
   return Math.max(tokenScore, prefixScore, suffixScore);
+}
+
+function isBlankLineReplacement(leftText = '', rightText = '') {
+  return isBlankLine(leftText) !== isBlankLine(rightText);
 }
 
 function mergeDiffBlock(blockRows, removedBlock, addedBlock) {
@@ -444,7 +475,16 @@ function buildTraceFocusedRows(leftContent = '', rightContent = '') {
   return rows;
 }
 
-function DiffCell({ lineNumber, text, rowType, otherText, emptyLabel, editable = false, onTextChange }) {
+function DiffCell({
+  lineNumber,
+  text,
+  rowType,
+  otherText,
+  emptyLabel,
+  editable = false,
+  onTextChange,
+  onEditorKeyDown,
+}) {
   const isPlaceholder = rowType === 'placeholder' || rowType === 'gap';
   const rowToneClass = rowType === 'added' || rowType === 'removed' || rowType === 'placeholder'
       ? 'bg-red-500/5'
@@ -478,14 +518,20 @@ function DiffCell({ lineNumber, text, rowType, otherText, emptyLabel, editable =
           <span className="relative block min-w-full">
             <span aria-hidden="true" className="block whitespace-pre text-[13px] font-mono leading-relaxed">
               {segments.map((segment, index) => (
-                <span key={`${lineNumber ?? 'x'}-edit-${index}`} className={getSegmentClass(segment)}>
+                <span
+                  key={`${lineNumber ?? 'x'}-edit-${index}`}
+                  className={getSegmentClass(segment)}
+                  style={{ pointerEvents: 'none' }}
+                >
                   {segment.text || ' '}
                 </span>
               ))}
             </span>
             <textarea
+              data-edit-line-number={lineNumber ?? undefined}
               value={text}
               onChange={(event) => onTextChange?.(event.target.value)}
+              onKeyDown={(event) => onEditorKeyDown?.(event)}
               rows={1}
               wrap="off"
               spellCheck={false}
@@ -505,7 +551,18 @@ function DiffCell({ lineNumber, text, rowType, otherText, emptyLabel, editable =
   );
 }
 
-function ComparePane({ title, badge, rows, side, paneRef, onScroll, editing = false, onLineChange, virtualRange = null }) {
+function ComparePane({
+  title,
+  badge,
+  rows,
+  side,
+  paneRef,
+  onScroll,
+  editing = false,
+  onLineChange,
+  onLineKeyDown,
+  virtualRange = null,
+}) {
   const visibleRows = virtualRange ? rows.slice(virtualRange.start, virtualRange.end) : rows;
   const topSpacerHeight = virtualRange ? virtualRange.start * VIRTUAL_ROW_HEIGHT : 0;
   const bottomSpacerHeight = virtualRange ? Math.max(rows.length - virtualRange.end, 0) * VIRTUAL_ROW_HEIGHT : 0;
@@ -529,6 +586,7 @@ function ComparePane({ title, badge, rows, side, paneRef, onScroll, editing = fa
                 emptyLabel={row.type === 'gap' ? '...' : ''}
                 editable={editing && row.leftNumber !== null}
                 onTextChange={(nextText) => onLineChange?.(row.leftNumber, nextText)}
+                onEditorKeyDown={(event) => onLineKeyDown?.(row.leftNumber, event)}
               />
             ) : (
               <DiffCell
@@ -618,6 +676,7 @@ function CompareWorkspace({
   onRightScroll,
   editingTarget,
   onEditLineChange,
+  onEditLineKeyDown,
   virtualRange,
   expanded = false,
   onToggleExpand,
@@ -647,6 +706,7 @@ function CompareWorkspace({
         onScroll={onLeftScroll}
         editing={editingTarget}
         onLineChange={onEditLineChange}
+        onLineKeyDown={onEditLineKeyDown}
         virtualRange={virtualRange}
       />
       <button
@@ -1180,6 +1240,7 @@ export default function App() {
   const [projectDirInput, setProjectDirInput] = useState('');
   const [editingTarget, setEditingTarget] = useState(false);
   const [editableTargetContent, setEditableTargetContent] = useState('');
+  const [pendingEditorSelection, setPendingEditorSelection] = useState(null);
   const [compareExpanded, setCompareExpanded] = useState(false);
   const [activeDiffIndex, setActiveDiffIndex] = useState(-1);
   const [virtualScrollTop, setVirtualScrollTop] = useState(0);
@@ -1265,7 +1326,7 @@ export default function App() {
 
   const fetchConfig = async () => {
     const res = await fetch('/api/config');
-    const data = await res.json();
+    const data = await readJsonResponse(res, '读取路径配置接口返回了非 JSON 响应，请检查后端服务');
     if (!res.ok) throw new Error(data.error || '读取路径配置失败');
     setActiveConfig(data);
     setSourceDirInput(data.sourceDir || '');
@@ -1275,7 +1336,7 @@ export default function App() {
   const fetchScanResults = async (preferredPath = null, options = {}) => {
     const query = options.resetManualStatuses ? '?reset_manual=1' : '';
     const res = await fetch(`/api/scan${query}`);
-    const data = await res.json();
+    const data = await readJsonResponse(res, '扫描接口返回了非 JSON 响应，请检查后端服务');
     if (!res.ok) throw new Error(data.error || '扫描失败');
     const normalized = data.map((item, index) => ({
       id: index + 1,
@@ -1318,7 +1379,7 @@ export default function App() {
       try {
         setContentLoading(true);
         const res = await fetch(`/api/file-content?path=${encodeURIComponent(selectedFile.path)}`);
-        const data = await res.json();
+        const data = await readJsonResponse(res, '读取文件内容接口返回了非 JSON 响应，请检查后端服务');
         if (!res.ok) throw new Error(data.error || '读取文件内容失败');
         setFullContentMap((prev) => ({
           ...prev,
@@ -1391,6 +1452,7 @@ export default function App() {
   useEffect(() => {
     setEditingTarget(false);
     setEditableTargetContent(selectedDisplay?.target?.content || '');
+    setPendingEditorSelection(null);
     setActiveDiffIndex(-1);
     setVirtualScrollTop(0);
     setHistoryOpen(false);
@@ -1689,6 +1751,105 @@ export default function App() {
     });
   };
 
+  const handleEditLineKeyDown = (lineNumber, event) => {
+    if (!lineNumber) return;
+
+    const { key, currentTarget } = event;
+    const { selectionStart, selectionEnd, value } = currentTarget;
+
+    if (key === 'Enter') {
+      event.preventDefault();
+      setEditableTargetContent((previousContent) => {
+        const lines = splitLines(previousContent);
+        const currentLine = lines[lineNumber - 1] ?? '';
+        const nextLines = [...lines];
+        nextLines.splice(
+          lineNumber - 1,
+          1,
+          currentLine.slice(0, selectionStart),
+          currentLine.slice(selectionEnd)
+        );
+        return nextLines.join('\n');
+      });
+      setPendingEditorSelection({ lineNumber: lineNumber + 1, caret: 0 });
+      return;
+    }
+
+    if (key === 'Backspace' && selectionStart === 0 && selectionEnd === 0) {
+      if (lineNumber === 1 && value === '') {
+        event.preventDefault();
+        return;
+      }
+
+      event.preventDefault();
+      setEditableTargetContent((previousContent) => {
+        const lines = splitLines(previousContent);
+        const nextLines = [...lines];
+
+        if (value === '') {
+          nextLines.splice(lineNumber - 1, 1);
+          return nextLines.join('\n');
+        }
+
+        const previousLine = nextLines[lineNumber - 2] ?? '';
+        nextLines.splice(lineNumber - 2, 2, previousLine + value);
+        return nextLines.join('\n');
+      });
+      const previousLineNumber = Math.max(lineNumber - 1, 1);
+      const previousLineLength = splitLines(editableTargetContent)[previousLineNumber - 1]?.length ?? 0;
+      setPendingEditorSelection({ lineNumber: previousLineNumber, caret: previousLineLength });
+      return;
+    }
+
+    if (key === 'Delete' && selectionStart === value.length && selectionEnd === value.length) {
+      const lines = splitLines(editableTargetContent);
+      if (lineNumber >= lines.length) {
+        return;
+      }
+
+      event.preventDefault();
+      const currentLineLength = value.length;
+      setEditableTargetContent((previousContent) => {
+        const previousLines = splitLines(previousContent);
+        const nextLines = [...previousLines];
+        const nextLine = nextLines[lineNumber] ?? '';
+        nextLines.splice(lineNumber - 1, 2, value + nextLine);
+        return nextLines.join('\n');
+      });
+      setPendingEditorSelection({ lineNumber, caret: currentLineLength });
+      return;
+    }
+
+    if (key === 'ArrowUp' || key === 'ArrowDown') {
+      const lines = splitLines(editableTargetContent);
+      const targetLineNumber = key === 'ArrowUp' ? lineNumber - 1 : lineNumber + 1;
+
+      if (targetLineNumber < 1 || targetLineNumber > lines.length) {
+        return;
+      }
+
+      event.preventDefault();
+      const targetLineLength = lines[targetLineNumber - 1]?.length ?? 0;
+      const caret = Math.min(selectionStart, targetLineLength);
+      setPendingEditorSelection({ lineNumber: targetLineNumber, caret });
+    }
+  };
+
+  useEffect(() => {
+    if (!editingTarget || !pendingEditorSelection) return;
+    const timer = window.requestAnimationFrame(() => {
+      const textarea = leftPaneRef.current?.querySelector(
+        `[data-edit-line-number="${pendingEditorSelection.lineNumber}"]`
+      );
+      if (!textarea) return;
+      textarea.focus();
+      textarea.setSelectionRange(pendingEditorSelection.caret, pendingEditorSelection.caret);
+      setPendingEditorSelection(null);
+    });
+
+    return () => window.cancelAnimationFrame(timer);
+  }, [editingTarget, pendingEditorSelection, selectedDiffRows]);
+
   const handleOpenGitHistory = async () => {
     if (!selectedDisplay?.path) return;
     try {
@@ -1844,6 +2005,7 @@ export default function App() {
                     onRightScroll={handleRightPaneScroll}
                     editingTarget={editingTarget}
                     onEditLineChange={handleEditLineChange}
+                    onEditLineKeyDown={handleEditLineKeyDown}
                     virtualRange={virtualRange}
                     expanded={false}
                     onToggleExpand={() => setCompareExpanded(true)}
@@ -1917,6 +2079,7 @@ export default function App() {
           onRightScroll={handleRightPaneScroll}
           editingTarget={editingTarget}
           onEditLineChange={handleEditLineChange}
+          onEditLineKeyDown={handleEditLineKeyDown}
           virtualRange={virtualRange}
           expanded
           onToggleExpand={() => setCompareExpanded(false)}

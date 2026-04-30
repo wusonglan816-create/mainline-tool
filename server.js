@@ -586,7 +586,11 @@ function getConfigOrThrow() {
 app.get('/api/config', async (req, res) => {
   try {
     const config = loadConfig();
-    res.json({ sourceDir: config.sourceDir, projectDir: config.projectDir, manualStatuses: config.manualStatuses });
+    res.json({
+      sourceDir: config.sourceDir,
+      projectDir: config.projectDir,
+      manualStatuses: config.manualStatuses,
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
