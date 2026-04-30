@@ -1,0 +1,96 @@
+前端是用 React + Vite 写的，后端是用 Node.js + Express 
+基于 React 和 Tailwind CSS 开发的 Mainline 资源包自动化合入工具
+1. 环境准备
+确保你的 Ubuntu 系统安装了 Node.js 和 npm。
+
+Bash
+# 更新系统包
+sudo apt update
+
+# 安装 Node.js 和 npm (建议使用 LTS 版本)
+sudo apt install nodejs npm
+2. 创建 React 项目
+在你的工作目录下创建一个新项目：
+
+Bash
+# 使用 Vite 创建 React 项目 (比传统的 create-react-app 快得多)
+npm create vite@latest mainline-tool -- --template react
+
+# 进入项目目录
+cd mainline-tool
+
+# 安装基础依赖
+npm install
+
+# 安装工具所需的图标库 (Lucide React) 和 Tailwind CSS
+npm install lucide-react
+
+# npm install -D tailwindcss postcss autoprefixer(cat package.json | grep tailwindcss
+ Tailwind v4不需要)
+# npx tailwindcss init -p(Tailwind v4不需要)
+
+2. 修改 src/index.css (App.css)
+在 Tailwind v4 中，引入方式简化了。请将 src/index.css 的内容清空，只写这一行：
+CSS
+@import "tailwindcss";
+
+3. 修改 vite.config.js
+需要安装 Tailwind 的 Vite 插件来支持 v4 的自动化处理。
+在终端运行：
+npm install @tailwindcss/vite
+然后修改你的 vite.config.js 文件内容如下：
+JavaScript
+import { defineConfig } from 'vite'
+import react from '@vitejs/plugin-react'
+import tailwindcss from '@tailwindcss/vite' // 引入插件
+
+// https://vitejs.dev/config/
+export default defineConfig({
+  plugins: [
+    react(),
+    tailwindcss(),
+  ],
+  server: {
+    proxy: {
+      '/api': {
+        target: 'http://localhost:3001',
+        changeOrigin: true,
+      },
+    },
+  },
+})
+4. 检查 src/main.jsx
+确保你的入口文件引入了刚才修改的 CSS 文件：
+
+JavaScript
+import React from 'react'
+import ReactDOM from 'react-dom/client'
+import App from './App.jsx'
+import './index.css' // 必须有这一行
+
+ReactDOM.createRoot(document.getElementById('root')).render(
+  <React.StrictMode>
+    <App />
+  </React.StrictMode>,
+)
+
+APP.jsx替换代码
+5. 启动工具
+在终端执行：
+npm run dev
+6. 访问工具
+终端会输出一个地址（通常是 http://localhost:5173）。在 Ubuntu 的浏览器中打开该地址，你就能看到可视化的合入界面了。
+
+后端Node.js：
+npm install express fs-extra path
+
+后端代码server.js
+目前前端运行在 5173 端口，后端在 3001 端口。浏览器出于安全考虑会拦截跨域请求。我们需要安装 cors 中间件。
+
+在终端执行：
+
+npm install cors
+
+启动：
+
+node server.js

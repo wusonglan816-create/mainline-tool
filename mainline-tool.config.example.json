@@ -1,0 +1,5 @@
+{
+  "sourceDir": "/path/to/source-package",
+  "projectDir": "/path/to/local-project",
+  "manualStatuses": {}
+}
