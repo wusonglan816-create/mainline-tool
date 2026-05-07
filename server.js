@@ -1,13 +1,19 @@
 import express from 'express';
+import dns from 'dns';
 import fs from 'fs-extra';
 import path from 'path';
 import os from 'os';
 import cors from 'cors';
 import { execFileSync } from 'child_process';
 import { fileURLToPath } from 'url';
+import { Pool } from 'pg';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+const ENV_FILE_NAMES = ['.env.local', '.env'];
+
+loadProjectEnvFiles();
+setPreferredDnsResultOrder();
 
 const app = express();
 const PORT = 3001;
@@ -19,6 +25,8 @@ const CONFIG_PATH = path.join(__dirname, 'mainline-tool.config.json');
 const DEFAULT_CONFIG = {
   sourceDir: '/home/wsl/Work_space/MTK_V/mainline_v_2025_oct_14238457',
   projectDir: '/home/wsl/Work_space/MTK_V/alps-release-v0.mp1.rc-default/alps',
+  noteProjectKey: '',
+  noteProjectKeys: [],
   manualStatuses: {},
 };
 const GMS_PATTERN = /(\/\/\[GMS\]\[\d+\]|begin-->|redmine|Redmine|end-->|\[GMS\])/;
@@ -33,6 +41,61 @@ const ARCHIVE_PREVIEW_EXTENSIONS = new Set(['.apk', '.apks', '.apex', '.jar', '.
 const PREVIEW_LIMIT = 5000;
 const COMMAND_BUFFER_LIMIT = 1024 * 1024 * 100;
 const BINARY_DUMP_BYTE_LIMIT = 64 * 1024;
+const NOTE_DB_URL = (
+  process.env.SUPABASE_SESSION_POOL_URL ||
+  process.env.SUPABASE_DB_URL ||
+  process.env.DATABASE_URL ||
+  ''
+).trim();
+const NOTE_TABLE_NAME = 'header_notes';
+const NOTE_CONTENT_MAX_LENGTH = 20000;
+
+let notesDbPool = null;
+let notesTableReady = false;
+let notesTableReadyPromise = null;
+
+function setPreferredDnsResultOrder() {
+  if (typeof dns.setDefaultResultOrder === 'function') {
+    dns.setDefaultResultOrder('ipv4first');
+  }
+}
+
+function loadProjectEnvFiles() {
+  ENV_FILE_NAMES.forEach((fileName) => {
+    const filePath = path.join(__dirname, fileName);
+    if (!fs.existsSync(filePath)) {
+      return;
+    }
+
+    const content = fs.readFileSync(filePath, 'utf8');
+    content.split(/\r?\n/).forEach((line) => {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith('#')) {
+        return;
+      }
+
+      const separatorIndex = trimmed.indexOf('=');
+      if (separatorIndex <= 0) {
+        return;
+      }
+
+      const key = trimmed.slice(0, separatorIndex).trim();
+      if (!key || process.env[key] !== undefined) {
+        return;
+      }
+
+      let value = trimmed.slice(separatorIndex + 1).trim();
+      if (
+        (value.startsWith('"') && value.endsWith('"')) ||
+        (value.startsWith("'") && value.endsWith("'"))
+      ) {
+        value = value.slice(1, -1);
+      }
+
+      process.env[key] = value;
+    });
+  });
+}
 
 function loadConfig() {
   if (!fs.existsSync(CONFIG_PATH)) {
@@ -41,15 +104,215 @@ function loadConfig() {
   }
 
   const fileConfig = fs.readJsonSync(CONFIG_PATH);
+  const noteProjectKey = typeof fileConfig.noteProjectKey === 'string' ? fileConfig.noteProjectKey.trim() : DEFAULT_CONFIG.noteProjectKey;
+  const noteProjectKeys = normalizeNoteProjectKeys(fileConfig.noteProjectKeys, noteProjectKey);
   return {
     sourceDir: fileConfig.sourceDir || DEFAULT_CONFIG.sourceDir,
     projectDir: fileConfig.projectDir || DEFAULT_CONFIG.projectDir,
+    noteProjectKey,
+    noteProjectKeys,
     manualStatuses: fileConfig.manualStatuses || {},
   };
 }
 
 function saveConfig(config) {
   fs.writeJsonSync(CONFIG_PATH, config, { spaces: 2 });
+}
+
+function normalizeNoteProjectKeys(rawKeys = [], selectedKey = '') {
+  const candidateKeys = Array.isArray(rawKeys) ? rawKeys : [];
+  const normalized = candidateKeys
+    .map((item) => (typeof item === 'string' ? item.trim() : ''))
+    .filter(Boolean);
+
+  if (typeof selectedKey === 'string' && selectedKey.trim()) {
+    normalized.unshift(selectedKey.trim());
+  }
+
+  return Array.from(new Set(normalized));
+}
+
+function getNextNoteTypeConfig(currentConfig, selectedKey) {
+  const noteProjectKeys = normalizeNoteProjectKeys(currentConfig.noteProjectKeys, selectedKey);
+  const nextSelectedKey = selectedKey && noteProjectKeys.includes(selectedKey)
+    ? selectedKey
+    : (noteProjectKeys[0] || '');
+
+  return {
+    ...currentConfig,
+    noteProjectKey: nextSelectedKey,
+    noteProjectKeys,
+  };
+}
+
+function hasNoteDatabaseConfig() {
+  return NOTE_DB_URL.length > 0;
+}
+
+function getDatabaseHostname(connectionString = '') {
+  try {
+    return new URL(connectionString).hostname;
+  } catch {
+    return '';
+  }
+}
+
+function isSupabaseDirectDatabaseHost(hostname = '') {
+  return /^db\.[a-z0-9-]+\.supabase\.co$/i.test(hostname);
+}
+
+function getSessionPoolerGuidance() {
+  return '当前网络不适合使用 Supabase 直连地址，请改用 Supabase Dashboard -> Connect -> Session pooler 里的连接串，并配置到 SUPABASE_SESSION_POOL_URL 或 SUPABASE_DB_URL。';
+}
+
+function toReadableDatabaseError(err) {
+  const message = err?.message || '数据库连接失败';
+  const hostname = getDatabaseHostname(NOTE_DB_URL);
+
+  if (
+    isSupabaseDirectDatabaseHost(hostname) &&
+    (
+      err?.code === 'ENETUNREACH' ||
+      err?.code === 'EHOSTUNREACH' ||
+      err?.code === 'ETIMEDOUT' ||
+      message.includes('ENETUNREACH')
+    )
+  ) {
+    return `${getSessionPoolerGuidance()} 当前配置主机: ${hostname}`;
+  }
+
+  return message;
+}
+
+function shouldUseDatabaseSsl(connectionString = '') {
+  return /supabase\./i.test(connectionString) || /sslmode=require/i.test(connectionString);
+}
+
+function getNotesDbPool() {
+  if (!hasNoteDatabaseConfig()) {
+    throw new Error('未配置备注数据库连接，请设置 SUPABASE_SESSION_POOL_URL、SUPABASE_DB_URL 或 DATABASE_URL');
+  }
+
+  if (!notesDbPool) {
+    notesDbPool = new Pool({
+      connectionString: NOTE_DB_URL,
+      max: 10,
+      idleTimeoutMillis: 30000,
+      ssl: shouldUseDatabaseSsl(NOTE_DB_URL) ? { rejectUnauthorized: false } : undefined,
+    });
+  }
+
+  return notesDbPool;
+}
+
+async function ensureNotesTable() {
+  const pool = getNotesDbPool();
+  if (notesTableReady) {
+    return pool;
+  }
+
+  if (!notesTableReadyPromise) {
+    notesTableReadyPromise = (async () => {
+      const client = await pool.connect();
+      try {
+        await client.query(`
+          CREATE TABLE IF NOT EXISTS ${NOTE_TABLE_NAME} (
+            id BIGSERIAL PRIMARY KEY,
+            project_key TEXT UNIQUE,
+            source_dir TEXT NOT NULL,
+            project_dir TEXT NOT NULL,
+            note_content TEXT NOT NULL DEFAULT '',
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+          )
+        `);
+        await client.query(`
+          ALTER TABLE ${NOTE_TABLE_NAME}
+          ADD COLUMN IF NOT EXISTS project_key TEXT
+        `);
+        await client.query(`
+          CREATE UNIQUE INDEX IF NOT EXISTS idx_${NOTE_TABLE_NAME}_project_key
+          ON ${NOTE_TABLE_NAME} (project_key)
+        `);
+        await client.query(`
+          CREATE INDEX IF NOT EXISTS idx_${NOTE_TABLE_NAME}_source_project
+          ON ${NOTE_TABLE_NAME} (source_dir, project_dir)
+        `);
+      } finally {
+        client.release();
+      }
+
+      notesTableReady = true;
+      return pool;
+    })().catch((err) => {
+      notesTableReadyPromise = null;
+      throw err;
+    });
+  }
+
+  return notesTableReadyPromise;
+}
+
+async function withNotesDbSession(callback) {
+  const pool = await ensureNotesTable();
+  const client = await pool.connect();
+  try {
+    return await callback(client);
+  } finally {
+    client.release();
+  }
+}
+
+function resolveNoteScope(input = {}) {
+  const config = loadConfig();
+  const projectKey = typeof input.projectKey === 'string' && input.projectKey.trim()
+    ? input.projectKey.trim()
+    : (config.noteProjectKey || '').trim();
+  const sourceDir = typeof input.sourceDir === 'string' && input.sourceDir.trim()
+    ? input.sourceDir.trim()
+    : config.sourceDir;
+  const projectDir = typeof input.projectDir === 'string' && input.projectDir.trim()
+    ? input.projectDir.trim()
+    : config.projectDir;
+
+  if (!projectKey) {
+    throw new Error('请先选择备注类型（noteProjectKey）');
+  }
+
+  if (!sourceDir || !projectDir) {
+    throw new Error('备注关联的资源包路径和项目路径不能为空');
+  }
+
+  return { projectKey, sourceDir, projectDir };
+}
+
+function validateNoteContent(noteContent) {
+  if (typeof noteContent !== 'string') {
+    return 'noteContent 必须是字符串';
+  }
+
+  if (noteContent.length > NOTE_CONTENT_MAX_LENGTH) {
+    return `备注内容不能超过 ${NOTE_CONTENT_MAX_LENGTH} 个字符`;
+  }
+
+  return null;
+}
+
+function validateNoteProjectKey(projectKey) {
+  if (typeof projectKey !== 'string') {
+    return 'projectKey 必须是字符串';
+  }
+
+  const trimmedProjectKey = projectKey.trim();
+  if (!trimmedProjectKey) {
+    return '备注类型不能为空';
+  }
+
+  if (trimmedProjectKey.length > 120) {
+    return '备注类型长度不能超过 120 个字符';
+  }
+
+  return null;
 }
 
 function getAllFiles(dirPath, arrayOfFiles = []) {
@@ -589,6 +852,8 @@ app.get('/api/config', async (req, res) => {
     res.json({
       sourceDir: config.sourceDir,
       projectDir: config.projectDir,
+      noteProjectKey: config.noteProjectKey,
+      noteProjectKeys: config.noteProjectKeys,
       manualStatuses: config.manualStatuses,
     });
   } catch (err) {
@@ -600,7 +865,9 @@ app.post('/api/config', async (req, res) => {
   try {
     const sourceDir = (req.body.sourceDir || '').trim();
     const projectDir = (req.body.projectDir || '').trim();
+    const noteProjectKey = typeof req.body.noteProjectKey === 'string' ? req.body.noteProjectKey.trim() : '';
     const currentConfig = loadConfig();
+    const noteProjectKeys = normalizeNoteProjectKeys(req.body.noteProjectKeys, noteProjectKey);
 
     if (!sourceDir || !projectDir) {
       return res.status(400).json({ error: '资源包路径和项目路径都不能为空' });
@@ -617,12 +884,164 @@ app.post('/api/config', async (req, res) => {
     const nextConfig = {
       sourceDir,
       projectDir,
+      noteProjectKey: noteProjectKey && noteProjectKeys.includes(noteProjectKey) ? noteProjectKey : (noteProjectKeys[0] || ''),
+      noteProjectKeys,
       manualStatuses: currentConfig.manualStatuses || {},
     };
     saveConfig(nextConfig);
     res.json(nextConfig);
   } catch (err) {
     res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/note-types', async (req, res) => {
+  try {
+    const projectKey = typeof req.body.projectKey === 'string' ? req.body.projectKey.trim() : '';
+    const validationError = validateNoteProjectKey(projectKey);
+    if (validationError) {
+      return res.status(400).json({ error: validationError });
+    }
+
+    const currentConfig = loadConfig();
+    const nextConfig = getNextNoteTypeConfig(
+      {
+        ...currentConfig,
+        noteProjectKeys: [...(currentConfig.noteProjectKeys || []), projectKey],
+      },
+      projectKey
+    );
+
+    saveConfig(nextConfig);
+    res.json(nextConfig);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/note-types/select', async (req, res) => {
+  try {
+    const projectKey = typeof req.body.projectKey === 'string' ? req.body.projectKey.trim() : '';
+    const currentConfig = loadConfig();
+
+    if (projectKey && !currentConfig.noteProjectKeys.includes(projectKey)) {
+      return res.status(400).json({ error: '所选备注类型不存在，请先新增后再使用' });
+    }
+
+    const nextConfig = getNextNoteTypeConfig(currentConfig, projectKey);
+    saveConfig(nextConfig);
+    res.json(nextConfig);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.delete('/api/note-types', async (req, res) => {
+  try {
+    const projectKey = typeof req.query.projectKey === 'string' ? req.query.projectKey.trim() : '';
+    const validationError = validateNoteProjectKey(projectKey);
+    if (validationError) {
+      return res.status(400).json({ error: validationError });
+    }
+
+    const currentConfig = loadConfig();
+    if (!currentConfig.noteProjectKeys.includes(projectKey)) {
+      return res.status(404).json({ error: '要删除的备注类型不存在' });
+    }
+
+    const remainingKeys = currentConfig.noteProjectKeys.filter((item) => item !== projectKey);
+    const nextConfig = getNextNoteTypeConfig(
+      {
+        ...currentConfig,
+        noteProjectKeys: remainingKeys,
+      },
+      currentConfig.noteProjectKey === projectKey ? '' : currentConfig.noteProjectKey
+    );
+
+    if (hasNoteDatabaseConfig()) {
+      await withNotesDbSession(async (client) => {
+        await client.query(
+          `DELETE FROM ${NOTE_TABLE_NAME} WHERE project_key = $1`,
+          [projectKey]
+        );
+      });
+    }
+
+    saveConfig(nextConfig);
+    res.json({
+      ...nextConfig,
+      deletedProjectKey: projectKey,
+    });
+  } catch (err) {
+    res.status(500).json({ error: toReadableDatabaseError(err) });
+  }
+});
+
+app.get('/api/header-note', async (req, res) => {
+  try {
+    const scope = resolveNoteScope(req.query);
+    const note = await withNotesDbSession(async (client) => {
+      const { rows } = await client.query(
+        `
+          SELECT note_content, created_at, updated_at
+          FROM ${NOTE_TABLE_NAME}
+          WHERE project_key = $1
+          LIMIT 1
+        `,
+        [scope.projectKey]
+      );
+      return rows[0] || null;
+    });
+
+    res.json({
+      ...scope,
+      noteContent: note?.note_content || '',
+      createdAt: note?.created_at || null,
+      updatedAt: note?.updated_at || null,
+    });
+  } catch (err) {
+    res.status(hasNoteDatabaseConfig() ? 500 : 503).json({ error: toReadableDatabaseError(err) });
+  }
+});
+
+app.post('/api/header-note', async (req, res) => {
+  try {
+    const noteContent = req.body.noteContent;
+    const validationError = validateNoteContent(noteContent);
+    if (validationError) {
+      return res.status(400).json({ error: validationError });
+    }
+
+    const scope = resolveNoteScope(req.body);
+    const note = await withNotesDbSession(async (client) => {
+      const { rows } = await client.query(
+        `
+          INSERT INTO ${NOTE_TABLE_NAME} (project_key, source_dir, project_dir, note_content)
+          VALUES ($1, $2, $3, $4)
+          ON CONFLICT (project_key)
+          DO UPDATE SET
+            source_dir = EXCLUDED.source_dir,
+            project_dir = EXCLUDED.project_dir,
+            note_content = EXCLUDED.note_content,
+            updated_at = NOW()
+          RETURNING id, note_content, created_at, updated_at
+        `,
+        [scope.projectKey, scope.sourceDir, scope.projectDir, noteContent]
+      );
+
+      return rows[0];
+    });
+
+    res.json({
+      ok: true,
+      ...scope,
+      id: note.id,
+      noteContent: note.note_content,
+      createdAt: note.created_at,
+      updatedAt: note.updated_at,
+    });
+  } catch (err) {
+    res.status(hasNoteDatabaseConfig() ? 500 : 503).json({ error: toReadableDatabaseError(err) });
   }
 });
 

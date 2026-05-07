@@ -1,5 +1,9 @@
 {
   "sourceDir": "/path/to/source-package",
   "projectDir": "/path/to/local-project",
+  "noteProjectKey": "gms-mainline-shared",
+  "noteProjectKeys": [
+    "gms-mainline-shared"
+  ],
   "manualStatuses": {}
 }

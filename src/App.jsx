@@ -4,6 +4,7 @@ import {
   CheckCircle2,
   ChevronRight,
   Clock,
+  Copy,
   Edit3,
   Maximize2,
   Minimize2,
@@ -14,10 +15,13 @@ import {
   FileText,
   GitCommitHorizontal,
   Loader2,
+  Plus,
   RefreshCw,
   Save,
   Search,
   ShieldAlert,
+  Trash2,
+  X,
   XCircle,
 } from 'lucide-react';
 
@@ -44,6 +48,49 @@ async function readJsonResponse(res, fallbackMessage) {
   }
 
   return JSON.parse(rawText || '{}');
+}
+
+async function copyTextWithFeedback(text, successMessage = '内容已复制') {
+  try {
+    await navigator.clipboard.writeText(text || '');
+    alert(successMessage);
+  } catch (err) {
+    alert(`复制失败: ${err.message}`);
+  }
+}
+
+function normalizeScanResultItem(item, indexFallback = 0) {
+  return {
+    id: item.id || indexFallback,
+    ...item,
+    size: item.type === 'bin' ? 'binary' : `${(item.sourceContent?.length || 0)}B`,
+    mtime: new Date().toLocaleString(),
+    content: item.sourceContent || '',
+    target: { content: item.targetContent || '', exists: item.targetExists },
+  };
+}
+
+function summarizeScanResults(items = []) {
+  return items.reduce((summary, item) => {
+    if (item.status === 'same') {
+      summary.sameCount += 1;
+      return summary;
+    }
+
+    summary.visibleCount += 1;
+    if (item.status === 'danger') {
+      summary.dangerCount += 1;
+    } else if (item.status === 'update') {
+      summary.updateCount += 1;
+    }
+
+    return summary;
+  }, {
+    visibleCount: 0,
+    sameCount: 0,
+    dangerCount: 0,
+    updateCount: 0,
+  });
 }
 
 function isBlankLine(line = '') {
@@ -795,24 +842,276 @@ function LoadingScreen() {
   );
 }
 
-function AppHeader({ activeConfig, merging, onMergeAll }) {
+function NoteFullscreenOverlay({
+  open,
+  noteContent,
+  noteLoading,
+  noteSaving,
+  onNoteChange,
+  onNoteSave,
+  onClose,
+}) {
+  if (!open) return null;
+
+  const noteBusy = noteLoading || noteSaving;
+
   return (
-    <header className="flex items-center justify-between px-6 py-4 bg-slate-900 border-b border-slate-800 shadow-xl shrink-0">
-      <div className="flex items-center gap-4">
+    <div className="absolute inset-0 z-20 flex items-center justify-center bg-slate-950/85 backdrop-blur-sm p-4">
+      <div className="w-full h-full max-w-[92vw] max-h-[88vh] overflow-hidden rounded-xl border border-slate-800 bg-slate-950 shadow-2xl flex flex-col">
+        <div className="px-5 py-3 border-b border-slate-800 bg-slate-900/90 shrink-0">
+          <div className="flex items-start justify-between gap-4">
+            <div className="min-w-0">
+              <div className="text-sm font-semibold text-white">备注放大查看</div>
+              <div className="text-[11px] text-slate-500">可在这里查看和编辑完整备注内容</div>
+            </div>
+            <div className="flex items-center gap-2 shrink-0">
+              <button
+                type="button"
+                onClick={() => copyTextWithFeedback(noteContent, '备注内容已复制')}
+                disabled={noteBusy}
+                className="inline-flex h-9 items-center gap-1.5 rounded-lg border border-slate-700 px-3 text-xs font-medium text-slate-300 transition hover:border-red-400/40 hover:text-red-200 disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                <Copy size={12} />
+                复制
+              </button>
+              <button
+                type="button"
+                onClick={onNoteSave}
+                disabled={noteBusy}
+                className="inline-flex h-9 items-center gap-1.5 rounded-lg border border-slate-700 px-3 text-xs font-medium text-slate-200 transition hover:border-emerald-400/40 hover:text-emerald-200 disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                {noteBusy ? <Loader2 size={12} className="animate-spin" /> : <Save size={12} />}
+                {noteLoading ? '加载中' : '保存'}
+              </button>
+              <button
+                onClick={onClose}
+                className="px-3 py-1.5 text-xs bg-slate-800 hover:bg-slate-700 text-white rounded-lg border border-slate-700 flex items-center gap-2"
+                title="收起"
+              >
+                <Minimize2 size={12} />
+                收起
+              </button>
+            </div>
+          </div>
+        </div>
+        <div className="flex-1 min-h-0 p-4">
+          <textarea
+            value={noteContent || ''}
+            onChange={onNoteChange}
+            disabled={noteBusy}
+            spellCheck={false}
+            wrap="soft"
+            className="h-full w-full resize-none rounded-xl border border-slate-700 bg-slate-950 px-4 py-3 text-sm leading-6 text-red-400 font-mono outline-none transition placeholder:text-slate-500 focus:border-red-400/50 disabled:cursor-wait disabled:opacity-60"
+            placeholder={noteLoading ? '正在读取备注...' : '输入需要保存到数据库的备注内容'}
+          />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function NoteTypeManagerModal({
+  open,
+  activeType,
+  noteTypeOptions,
+  noteTypePending,
+  newNoteTypeInput,
+  onNewNoteTypeChange,
+  onAdd,
+  onDelete,
+  onClose,
+}) {
+  if (!open) {
+    return null;
+  }
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/75 px-4">
+      <div className="w-full max-w-xl rounded-2xl border border-slate-800 bg-slate-900 shadow-2xl shadow-black/40">
+        <div className="flex items-center justify-between border-b border-slate-800 px-5 py-4">
+          <div>
+            <h3 className="text-sm font-semibold text-slate-100">备注类型管理</h3>
+            <p className="mt-1 text-xs text-slate-400">新增或删除 project_key，备注会按当前类型单独存储。</p>
+          </div>
+          <button
+            type="button"
+            onClick={onClose}
+            disabled={noteTypePending}
+            className="inline-flex h-9 w-9 items-center justify-center rounded-lg border border-slate-700 text-slate-400 transition hover:border-slate-500 hover:text-slate-200 disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            <X size={16} />
+          </button>
+        </div>
+
+        <div className="space-y-4 px-5 py-4">
+          <div className="flex items-center gap-2">
+            <input
+              value={newNoteTypeInput}
+              onChange={onNewNoteTypeChange}
+              disabled={noteTypePending}
+              className="h-10 min-w-0 flex-1 rounded-lg border border-slate-700 bg-slate-950 px-3 text-sm text-slate-100 outline-none transition placeholder:text-slate-500 focus:border-amber-400/50 disabled:cursor-not-allowed disabled:opacity-60"
+              placeholder="输入新的备注类型，例如 gms-mainline-v15"
+            />
+            <button
+              type="button"
+              onClick={onAdd}
+              disabled={noteTypePending}
+              className="inline-flex h-10 shrink-0 items-center gap-1.5 rounded-lg border border-slate-700 px-3 text-sm font-medium text-slate-200 transition hover:border-amber-400/40 hover:text-amber-200 disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              {noteTypePending ? <Loader2 size={14} className="animate-spin" /> : <Plus size={14} />}
+              新增
+            </button>
+          </div>
+
+          <div className="max-h-72 space-y-2 overflow-y-auto pr-1">
+            {noteTypeOptions.length === 0 ? (
+              <div className="rounded-xl border border-dashed border-slate-700 px-4 py-6 text-center text-sm text-slate-400">
+                还没有备注类型，请先新增一个。
+              </div>
+            ) : (
+              noteTypeOptions.map((item) => (
+                <div
+                  key={item}
+                  className={`flex items-center justify-between rounded-xl border px-3 py-2.5 ${
+                    item === activeType
+                      ? 'border-amber-400/50 bg-amber-400/10'
+                      : 'border-slate-800 bg-slate-950/60'
+                  }`}
+                >
+                  <div className="min-w-0">
+                    <p className="truncate text-sm font-medium text-slate-100">{item}</p>
+                    <p className="mt-1 text-[11px] text-slate-500">{item === activeType ? '当前使用中' : '可切换使用'}</p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => onDelete(item)}
+                    disabled={noteTypePending}
+                    className="inline-flex h-9 shrink-0 items-center gap-1.5 rounded-lg border border-slate-700 px-3 text-xs font-medium text-red-300 transition hover:border-red-400/40 hover:text-red-200 disabled:cursor-not-allowed disabled:opacity-60"
+                  >
+                    <Trash2 size={13} />
+                    删除
+                  </button>
+                </div>
+              ))
+            )}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function AppHeader({
+  activeConfig,
+  merging,
+  noteProjectKeyInput,
+  noteTypeOptions,
+  noteContent,
+  noteLoading,
+  noteSaving,
+  noteTypePending,
+  onProjectKeyChange,
+  onOpenNoteTypeManager,
+  onOpenNoteExpand,
+  onNoteChange,
+  onNoteSave,
+  onMergeAll,
+}) {
+  const noteBusy = noteLoading || noteSaving || noteTypePending;
+
+  return (
+    <header className="flex flex-col gap-4 px-6 py-4 bg-slate-900 border-b border-slate-800 shadow-xl shrink-0 xl:flex-row xl:items-center xl:justify-between">
+      <div className="flex items-center gap-4 min-w-0">
         <div className="p-2.5 bg-indigo-600 rounded-xl shadow-lg shadow-indigo-500/20">
           <FileArchive size={24} className="text-white" />
         </div>
-        <div>
+        <div className="min-w-0">
           <h1 className="text-lg font-bold text-white flex items-center gap-2">
             GMS资源 自动合入助手
             <span className="text-[10px] bg-indigo-500/20 text-indigo-400 px-2 py-0.5 rounded border border-indigo-500/30 font-medium">V2.0-OCT</span>
           </h1>
-          <p className="text-xs text-slate-500 font-mono">Target: {activeConfig.projectDir || '-'}</p>
+          <p className="text-xs text-slate-500 font-mono truncate">Target: {activeConfig.projectDir || '-'}</p>
         </div>
       </div>
 
-      <div className="flex items-center gap-3">
-        <button disabled={merging} onClick={onMergeAll} className="flex items-center gap-2 px-6 py-2.5 bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-white rounded-lg font-bold transition-all shadow-lg shadow-blue-600/20 active:scale-95">
+      <div className="flex flex-col items-stretch gap-3 xl:flex-row xl:items-center xl:justify-end">
+        <div className="flex h-15 items-center gap-2 xl:w-[820px]">
+          <span className="shrink-0 text-xs font-semibold tracking-[0.18em] text-amber-400">
+            备注类型
+          </span>
+          <select
+            value={noteProjectKeyInput || ''}
+            onChange={onProjectKeyChange}
+            disabled={noteBusy}
+            className="h-10 w-[220px] shrink-0 rounded-lg border border-slate-700 bg-slate-950 px-3 text-xs text-amber-200 outline-none transition focus:border-amber-400/50 disabled:cursor-wait disabled:opacity-60"
+          >
+            <option value="">请选择备注类型</option>
+            {noteTypeOptions.map((item) => (
+              <option key={item} value={item}>
+                {item}
+              </option>
+            ))}
+          </select>
+          <button
+            type="button"
+            onClick={onOpenNoteTypeManager}
+            disabled={noteBusy}
+            className="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-lg border border-slate-700 text-slate-300 transition hover:border-amber-400/40 hover:text-amber-200 disabled:cursor-not-allowed disabled:opacity-60"
+            title="管理备注类型"
+          >
+            <Plus size={14} />
+          </button>
+          <span className="shrink-0 text-xs font-semibold tracking-[0.18em] text-red-400">
+            备注
+          </span>
+          <div className="relative h-10 min-w-0 max-w-[50ch] flex-1">
+            <textarea
+              value={noteContent || ''}
+              onChange={onNoteChange}
+              disabled={noteBusy}
+              spellCheck={false}
+              rows={2}
+              wrap="soft"
+              className="h-10 w-full resize-none overflow-y-auto rounded-lg border border-slate-700 bg-slate-950 px-3 py-1.5 pr-9 text-xs leading-5 text-red-400 font-mono outline-none transition placeholder:text-slate-500 focus:border-red-400/50 disabled:cursor-wait disabled:opacity-60 [&::-webkit-scrollbar]:hidden"
+              placeholder={noteLoading ? '正在读取备注...' : '输入需要保存到数据库的备注内容'}
+              style={{ scrollbarWidth: 'none', msOverflowStyle: 'none' }}
+            />
+            <button
+              type="button"
+              onClick={onOpenNoteExpand}
+              disabled={noteBusy}
+              className="absolute bottom-1 right-1 inline-flex h-6 w-6 items-center justify-center rounded-md border border-slate-700 bg-slate-900/90 text-slate-400 transition hover:border-red-400/40 hover:text-red-200 disabled:cursor-not-allowed disabled:opacity-60"
+              title="放大查看备注"
+            >
+              <Maximize2 size={11} />
+            </button>
+          </div>
+          <button
+            type="button"
+            onClick={() => copyTextWithFeedback(noteContent, '备注内容已复制')}
+            disabled={noteBusy}
+            className="inline-flex h-10 shrink-0 items-center gap-1.5 rounded-lg border border-slate-700 px-3 text-[11px] font-medium text-slate-300 transition hover:border-red-400/40 hover:text-red-200 disabled:cursor-not-allowed disabled:opacity-60"
+          >
+            <Copy size={12} />
+            复制
+          </button>
+          <button
+            type="button"
+            onClick={onNoteSave}
+            disabled={noteBusy}
+            className="inline-flex h-10 shrink-0 items-center gap-1.5 rounded-lg border border-slate-700 px-3 text-[11px] font-medium text-slate-200 transition hover:border-emerald-400/40 hover:text-emerald-200 disabled:cursor-not-allowed disabled:opacity-60"
+          >
+            {noteBusy ? <Loader2 size={12} className="animate-spin" /> : <Save size={12} />}
+            {noteLoading ? '加载中' : '保存'}
+          </button>
+        </div>
+
+        <button
+          type="button"
+          disabled={merging || noteLoading}
+          onClick={onMergeAll}
+          className="flex h-15 items-center justify-center gap-2 px-6 py-2.5 bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-white rounded-lg font-bold transition-all shadow-lg shadow-blue-600/20 active:scale-95"
+        >
           {merging ? <Loader2 className="animate-spin w-4 h-4" /> : <FileOutput size={18} />}
           执行代码合入
         </button>
@@ -845,7 +1144,7 @@ function PathConfigSection({
           {configSaving ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshCw size={16} />} 保存扫描
         </button>
       </div>
-      <p className="mt-2 text-xs text-slate-500 font-mono">当前生效: Source = {activeConfig.sourceDir || '-'} | Project = {activeConfig.projectDir || '-'}</p>
+      <p className="mt-2 text-xs text-slate-500 font-mono">当前生效: Remark Type = {activeConfig.noteProjectKey || '-'} | Source = {activeConfig.sourceDir || '-'} | Project = {activeConfig.projectDir || '-'}</p>
     </section>
   );
 }
@@ -1235,9 +1534,11 @@ export default function App() {
   const [searchTerm, setSearchTerm] = useState('');
   const [fullContentMap, setFullContentMap] = useState({});
   const [expandedGroups, setExpandedGroups] = useState({});
-  const [activeConfig, setActiveConfig] = useState({ sourceDir: '', projectDir: '' });
+  const [activeConfig, setActiveConfig] = useState({ sourceDir: '', projectDir: '', noteProjectKey: '', noteProjectKeys: [] });
   const [sourceDirInput, setSourceDirInput] = useState('');
   const [projectDirInput, setProjectDirInput] = useState('');
+  const [noteProjectKeyInput, setNoteProjectKeyInput] = useState('');
+  const [noteTypeOptions, setNoteTypeOptions] = useState([]);
   const [editingTarget, setEditingTarget] = useState(false);
   const [editableTargetContent, setEditableTargetContent] = useState('');
   const [pendingEditorSelection, setPendingEditorSelection] = useState(null);
@@ -1253,6 +1554,13 @@ export default function App() {
   const [commitDetailLoading, setCommitDetailLoading] = useState(false);
   const [commitDetailError, setCommitDetailError] = useState('');
   const [commitDetail, setCommitDetail] = useState(null);
+  const [headerNote, setHeaderNote] = useState('');
+  const [noteLoading, setNoteLoading] = useState(false);
+  const [noteSaving, setNoteSaving] = useState(false);
+  const [noteExpanded, setNoteExpanded] = useState(false);
+  const [noteTypeManagerOpen, setNoteTypeManagerOpen] = useState(false);
+  const [newNoteTypeInput, setNewNoteTypeInput] = useState('');
+  const [noteTypePending, setNoteTypePending] = useState(false);
   const leftPaneRef = useRef(null);
   const rightPaneRef = useRef(null);
   const syncingRef = useRef(false);
@@ -1331,6 +1639,37 @@ export default function App() {
     setActiveConfig(data);
     setSourceDirInput(data.sourceDir || '');
     setProjectDirInput(data.projectDir || '');
+    setNoteProjectKeyInput(data.noteProjectKey || '');
+    setNoteTypeOptions(data.noteProjectKeys || []);
+    return data;
+  };
+
+  const fetchHeaderNote = async (config) => {
+    const projectKey = config?.noteProjectKey || '';
+    const sourceDir = config?.sourceDir || '';
+    const projectDir = config?.projectDir || '';
+
+    if (!projectKey || !sourceDir || !projectDir) {
+      setHeaderNote('');
+      return '';
+    }
+
+    try {
+      setNoteLoading(true);
+      const query = new URLSearchParams({ projectKey, sourceDir, projectDir });
+      const res = await fetch(`/api/header-note?${query.toString()}`);
+      const data = await readJsonResponse(res, '读取备注接口返回了非 JSON 响应，请检查后端服务');
+      if (!res.ok) {
+        throw new Error(data.error || '读取备注失败');
+      }
+      setHeaderNote(data.noteContent || '');
+      return data.noteContent || '';
+    } catch {
+      setHeaderNote('');
+      return '';
+    } finally {
+      setNoteLoading(false);
+    }
   };
 
   const fetchScanResults = async (preferredPath = null, options = {}) => {
@@ -1338,32 +1677,19 @@ export default function App() {
     const res = await fetch(`/api/scan${query}`);
     const data = await readJsonResponse(res, '扫描接口返回了非 JSON 响应，请检查后端服务');
     if (!res.ok) throw new Error(data.error || '扫描失败');
-    const normalized = data.map((item, index) => ({
-      id: index + 1,
-      ...item,
-      size: item.type === 'bin' ? 'binary' : `${(item.sourceContent?.length || 0)}B`,
-      mtime: new Date().toLocaleString(),
-      content: item.sourceContent || '',
-      target: { content: item.targetContent || '', exists: item.targetExists },
-    }));
+    const normalized = data.map((item, index) => normalizeScanResultItem(item, index + 1));
     applyScanResults(normalized, preferredPath);
   };
-
-  const normalizeScanItem = (item, indexFallback = 0) => ({
-    id: item.id || indexFallback,
-    ...item,
-    size: item.type === 'bin' ? 'binary' : `${(item.sourceContent?.length || 0)}B`,
-    mtime: new Date().toLocaleString(),
-    content: item.sourceContent || '',
-    target: { content: item.targetContent || '', exists: item.targetExists },
-  });
 
   useEffect(() => {
     const init = async () => {
       try {
         setLoading(true);
-        await fetchConfig();
-        await fetchScanResults();
+        const config = await fetchConfig();
+        await Promise.all([
+          fetchScanResults(),
+          fetchHeaderNote(config),
+        ]);
       } catch (err) {
         alert(err.message);
       } finally {
@@ -1427,10 +1753,12 @@ export default function App() {
     });
   }, [groupedResults]);
 
-  const visibleCount = useMemo(() => scanResults.filter((item) => item.status !== 'same').length, [scanResults]);
-  const sameCount = useMemo(() => scanResults.filter((item) => item.status === 'same').length, [scanResults]);
-  const dangerCount = useMemo(() => scanResults.filter((item) => item.status === 'danger').length, [scanResults]);
-  const updateCount = useMemo(() => scanResults.filter((item) => item.status === 'update').length, [scanResults]);
+  const {
+    visibleCount,
+    sameCount,
+    dangerCount,
+    updateCount,
+  } = useMemo(() => summarizeScanResults(scanResults), [scanResults]);
 
   const selectedDisplay = useMemo(() => {
     if (!selectedFile) return null;
@@ -1582,12 +1910,22 @@ export default function App() {
       const res = await fetch('/api/config', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ sourceDir: sourceDirInput, projectDir: projectDirInput }),
+        body: JSON.stringify({
+          sourceDir: sourceDirInput,
+          projectDir: projectDirInput,
+          noteProjectKey: noteProjectKeyInput,
+          noteProjectKeys: noteTypeOptions,
+        }),
       });
-      const data = await res.json();
+      const data = await readJsonResponse(res, '保存路径接口返回了非 JSON 响应，请检查后端服务');
       if (!res.ok) throw new Error(data.error || '保存路径失败');
       setActiveConfig({ ...data, manualStatuses: {} });
-      await fetchScanResults(selectedFile?.path || null, { resetManualStatuses: true });
+      setNoteProjectKeyInput(data.noteProjectKey || '');
+      setNoteTypeOptions(data.noteProjectKeys || []);
+      await Promise.all([
+        fetchScanResults(selectedFile?.path || null, { resetManualStatuses: true }),
+        fetchHeaderNote(data),
+      ]);
       alert('路径已保存并扫描完成。');
     } catch (err) {
       alert(`保存扫描失败: ${err.message}`);
@@ -1599,9 +1937,6 @@ export default function App() {
   const handleRescan = async () => {
     try {
       setLoading(true);
-      // setSelectedFile(null);
-      // setScanResults([]);
-      // setFullContentMap({});
       setActiveConfig((previous) => ({ ...previous, manualStatuses: {} }));
       await fetchScanResults(selectedFile?.path || null, { resetManualStatuses: true });
     } catch (err) {
@@ -1638,6 +1973,141 @@ export default function App() {
   const handleMergeAction = async () => {
     const filesToMerge = scanResults.filter((item) => item.status === 'update').map((item) => item.path);
     await handleMergeFiles(filesToMerge, '全部 Ready 文件');
+  };
+
+  const handleSaveHeaderNote = async () => {
+    const effectiveProjectKey = noteProjectKeyInput.trim() || activeConfig.noteProjectKey || '';
+
+    if (!effectiveProjectKey) {
+      alert('请先选择备注类型，再保存备注。');
+      return;
+    }
+
+    if (!activeConfig.sourceDir || !activeConfig.projectDir) {
+      alert('当前还没有可用的扫描路径，无法保存备注。');
+      return;
+    }
+
+    try {
+      setNoteSaving(true);
+      const res = await fetch('/api/header-note', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          projectKey: effectiveProjectKey,
+          sourceDir: activeConfig.sourceDir,
+          projectDir: activeConfig.projectDir,
+          noteContent: headerNote,
+        }),
+      });
+      const data = await readJsonResponse(res, '保存备注接口返回了非 JSON 响应，请检查后端服务');
+      if (!res.ok) throw new Error(data.error || '保存备注失败');
+      setHeaderNote(data.noteContent || '');
+      alert('备注已保存到数据库。');
+    } catch (err) {
+      alert(`保存备注失败: ${err.message}`);
+    } finally {
+      setNoteSaving(false);
+    }
+  };
+
+  const applyNoteTypeConfig = (config) => {
+    setActiveConfig((previous) => ({
+      ...previous,
+      noteProjectKey: config.noteProjectKey || '',
+      noteProjectKeys: config.noteProjectKeys || [],
+    }));
+    setNoteProjectKeyInput(config.noteProjectKey || '');
+    setNoteTypeOptions(config.noteProjectKeys || []);
+  };
+
+  const handleNoteTypeChange = async (event) => {
+    const nextProjectKey = event.target.value;
+    setNoteProjectKeyInput(nextProjectKey);
+    setActiveConfig((previous) => ({ ...previous, noteProjectKey: nextProjectKey }));
+
+    try {
+      setNoteTypePending(true);
+      const res = await fetch('/api/note-types/select', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ projectKey: nextProjectKey }),
+      });
+      const data = await readJsonResponse(res, '切换备注类型接口返回了非 JSON 响应，请检查后端服务');
+      if (!res.ok) throw new Error(data.error || '切换备注类型失败');
+      applyNoteTypeConfig(data);
+      await fetchHeaderNote({
+        noteProjectKey: data.noteProjectKey,
+        sourceDir: activeConfig.sourceDir,
+        projectDir: activeConfig.projectDir,
+      });
+    } catch (err) {
+      alert(`切换备注类型失败: ${err.message}`);
+      const config = await fetchConfig();
+      await fetchHeaderNote(config);
+    } finally {
+      setNoteTypePending(false);
+    }
+  };
+
+  const handleAddNoteType = async () => {
+    const projectKey = newNoteTypeInput.trim();
+    if (!projectKey) {
+      alert('请先输入备注类型。');
+      return;
+    }
+
+    try {
+      setNoteTypePending(true);
+      const res = await fetch('/api/note-types', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ projectKey }),
+      });
+      const data = await readJsonResponse(res, '新增备注类型接口返回了非 JSON 响应，请检查后端服务');
+      if (!res.ok) throw new Error(data.error || '新增备注类型失败');
+      applyNoteTypeConfig(data);
+      setNewNoteTypeInput('');
+      await fetchHeaderNote({
+        noteProjectKey: data.noteProjectKey,
+        sourceDir: activeConfig.sourceDir,
+        projectDir: activeConfig.projectDir,
+      });
+    } catch (err) {
+      alert(`新增备注类型失败: ${err.message}`);
+    } finally {
+      setNoteTypePending(false);
+    }
+  };
+
+  const handleDeleteNoteType = async (projectKey) => {
+    if (!projectKey) {
+      return;
+    }
+
+    const confirmed = window.confirm(`确认删除备注类型“${projectKey}”吗？这会同时删除该类型下保存的备注内容。`);
+    if (!confirmed) {
+      return;
+    }
+
+    try {
+      setNoteTypePending(true);
+      const res = await fetch(`/api/note-types?projectKey=${encodeURIComponent(projectKey)}`, {
+        method: 'DELETE',
+      });
+      const data = await readJsonResponse(res, '删除备注类型接口返回了非 JSON 响应，请检查后端服务');
+      if (!res.ok) throw new Error(data.error || '删除备注类型失败');
+      applyNoteTypeConfig(data);
+      await fetchHeaderNote({
+        noteProjectKey: data.noteProjectKey,
+        sourceDir: activeConfig.sourceDir,
+        projectDir: activeConfig.projectDir,
+      });
+    } catch (err) {
+      alert(`删除备注类型失败: ${err.message}`);
+    } finally {
+      setNoteTypePending(false);
+    }
   };
 
   const handleMergeGroup = async (event, group) => {
@@ -1719,7 +2189,7 @@ export default function App() {
       if (!res.ok) throw new Error(data.error || '保存内容失败');
       setEditingTarget(false);
       if (data.item) {
-        const normalizedItem = normalizeScanItem(data.item, selectedFile?.id || 1);
+        const normalizedItem = normalizeScanResultItem(data.item, selectedFile?.id || 1);
         setScanResults((previous) => previous.map((item) => (
           item.path === normalizedItem.path ? { ...item, ...normalizedItem } : item
         )));
@@ -1906,7 +2376,22 @@ export default function App() {
 
   return (
     <div className="flex flex-col h-screen bg-slate-950 text-slate-200 overflow-hidden font-sans">
-      <AppHeader activeConfig={activeConfig} merging={merging} onMergeAll={handleMergeAction} />
+      <AppHeader
+        activeConfig={activeConfig}
+        merging={merging}
+        noteProjectKeyInput={noteProjectKeyInput}
+        noteTypeOptions={noteTypeOptions}
+        noteContent={headerNote}
+        noteLoading={noteLoading}
+        noteSaving={noteSaving}
+        noteTypePending={noteTypePending}
+        onProjectKeyChange={handleNoteTypeChange}
+        onOpenNoteTypeManager={() => setNoteTypeManagerOpen(true)}
+        onOpenNoteExpand={() => setNoteExpanded(true)}
+        onNoteChange={(event) => setHeaderNote(event.target.value)}
+        onNoteSave={handleSaveHeaderNote}
+        onMergeAll={handleMergeAction}
+      />
       <PathConfigSection
         sourceDirInput={sourceDirInput}
         projectDirInput={projectDirInput}
@@ -1915,6 +2400,30 @@ export default function App() {
         onSourceChange={(e) => setSourceDirInput(e.target.value)}
         onProjectChange={(e) => setProjectDirInput(e.target.value)}
         onSave={handleSaveConfig}
+      />
+      <NoteTypeManagerModal
+        open={noteTypeManagerOpen}
+        activeType={noteProjectKeyInput}
+        noteTypeOptions={noteTypeOptions}
+        noteTypePending={noteTypePending}
+        newNoteTypeInput={newNoteTypeInput}
+        onNewNoteTypeChange={(event) => setNewNoteTypeInput(event.target.value)}
+        onAdd={handleAddNoteType}
+        onDelete={handleDeleteNoteType}
+        onClose={() => {
+          if (noteTypePending) return;
+          setNoteTypeManagerOpen(false);
+          setNewNoteTypeInput('');
+        }}
+      />
+      <NoteFullscreenOverlay
+        open={noteExpanded}
+        noteContent={headerNote}
+        noteLoading={noteLoading}
+        noteSaving={noteSaving}
+        onNoteChange={(event) => setHeaderNote(event.target.value)}
+        onNoteSave={handleSaveHeaderNote}
+        onClose={() => setNoteExpanded(false)}
       />
 
       <main className="flex flex-1 overflow-hidden">
