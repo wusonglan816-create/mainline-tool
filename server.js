@@ -38,6 +38,7 @@ const TEXT_EXTENSIONS = new Set([
 ]);
 const BINARY_EXTENSIONS = new Set(['.apk', '.apex', '.jar', '.so', '.bin', '.img', '.dat', '.o', '.a']);
 const ARCHIVE_PREVIEW_EXTENSIONS = new Set(['.apk', '.apks', '.apex', '.jar', '.srcjar']);
+const IGNORED_SCAN_DIR_NAMES = new Set(['.git']);
 const PREVIEW_LIMIT = 5000;
 const COMMAND_BUFFER_LIMIT = 1024 * 1024 * 100;
 const BINARY_DUMP_BYTE_LIMIT = 64 * 1024;
@@ -319,8 +320,27 @@ function getAllFiles(dirPath, arrayOfFiles = []) {
   const files = fs.readdirSync(dirPath);
 
   files.forEach((file) => {
+    if (IGNORED_SCAN_DIR_NAMES.has(file)) {
+      return;
+    }
+
     const fullPath = path.join(dirPath, file);
-    if (fs.statSync(fullPath).isDirectory()) {
+    let stat;
+    try {
+      stat = fs.lstatSync(fullPath);
+    } catch {
+      return;
+    }
+
+    if (stat.isSymbolicLink()) {
+      try {
+        stat = fs.statSync(fullPath);
+      } catch {
+        return;
+      }
+    }
+
+    if (stat.isDirectory()) {
       getAllFiles(fullPath, arrayOfFiles);
     } else {
       arrayOfFiles.push(fullPath);
