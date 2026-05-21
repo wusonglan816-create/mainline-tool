@@ -1164,6 +1164,7 @@ function FileSidebar({
   onSelectFile,
   merging,
   onMergeGroup,
+  scanning,
 }) {
   return (
     <div className="w-80 border-r border-slate-800 flex flex-col bg-slate-900/30 shrink-0">
@@ -1179,7 +1180,12 @@ function FileSidebar({
         </div>
       </div>
       <div className="flex-1 overflow-y-auto custom-scrollbar">
-        {groupedResults.length > 0 ? groupedResults.map((group) => (
+        {scanning && groupedResults.length === 0 ? (
+          <div className="flex flex-col items-center justify-center py-16 text-slate-500">
+            <Loader2 className="w-6 h-6 animate-spin text-blue-400 mb-3" />
+            <span className="text-xs">正在扫描文件...</span>
+          </div>
+        ) : groupedResults.length > 0 ? groupedResults.map((group) => (
           <div key={group.extension} className="border-b border-slate-800/40">
             <button onClick={() => setExpandedGroups((prev) => ({ ...prev, [group.extension]: !prev[group.extension] }))} className="w-full flex items-center justify-between px-4 py-3 bg-slate-900/40 hover:bg-slate-800/50 transition-colors text-left">
               <span className="flex items-center gap-2 text-xs font-semibold text-slate-300">
@@ -1225,7 +1231,7 @@ function FileSidebar({
               </div>
             ))}
           </div>
-        )) : <div className="p-10 text-center text-slate-600 text-xs">没有找到匹配的文件</div>}
+        )) : <div className="p-10 text-center text-slate-600 text-xs">{scanning ? '正在扫描...' : '没有找到匹配的文件'}</div>}
       </div>
     </div>
   );
@@ -1561,6 +1567,7 @@ export default function App() {
   const [noteTypeManagerOpen, setNoteTypeManagerOpen] = useState(false);
   const [newNoteTypeInput, setNewNoteTypeInput] = useState('');
   const [noteTypePending, setNoteTypePending] = useState(false);
+  const [scanning, setScanning] = useState(false);
   const leftPaneRef = useRef(null);
   const rightPaneRef = useRef(null);
   const syncingRef = useRef(false);
@@ -1646,17 +1653,15 @@ export default function App() {
 
   const fetchHeaderNote = async (config) => {
     const projectKey = config?.noteProjectKey || '';
-    const sourceDir = config?.sourceDir || '';
-    const projectDir = config?.projectDir || '';
 
-    if (!projectKey || !sourceDir || !projectDir) {
+    if (!projectKey) {
       setHeaderNote('');
       return '';
     }
 
     try {
       setNoteLoading(true);
-      const query = new URLSearchParams({ projectKey, sourceDir, projectDir });
+      const query = new URLSearchParams({ projectKey });
       const res = await fetch(`/api/header-note?${query.toString()}`);
       const data = await readJsonResponse(res, '读取备注接口返回了非 JSON 响应，请检查后端服务');
       if (!res.ok) {
@@ -1686,13 +1691,18 @@ export default function App() {
       try {
         setLoading(true);
         const config = await fetchConfig();
-        await Promise.all([
-          fetchScanResults(),
-          fetchHeaderNote(config),
-        ]);
+        await fetchHeaderNote(config);
+        setLoading(false);
+        try {
+          setScanning(true);
+          await fetchScanResults();
+        } catch (scanErr) {
+          alert(scanErr.message);
+        } finally {
+          setScanning(false);
+        }
       } catch (err) {
         alert(err.message);
-      } finally {
         setLoading(false);
       }
     };
@@ -1922,10 +1932,12 @@ export default function App() {
       setActiveConfig({ ...data, manualStatuses: {} });
       setNoteProjectKeyInput(data.noteProjectKey || '');
       setNoteTypeOptions(data.noteProjectKeys || []);
-      await Promise.all([
-        fetchScanResults(selectedFile?.path || null, { resetManualStatuses: true }),
-        fetchHeaderNote(data),
-      ]);
+      try {
+        setScanning(true);
+        await fetchScanResults(selectedFile?.path || null, { resetManualStatuses: true });
+      } finally {
+        setScanning(false);
+      }
       alert('路径已保存并扫描完成。');
     } catch (err) {
       alert(`保存扫描失败: ${err.message}`);
@@ -1936,13 +1948,13 @@ export default function App() {
 
   const handleRescan = async () => {
     try {
-      setLoading(true);
+      setScanning(true);
       setActiveConfig((previous) => ({ ...previous, manualStatuses: {} }));
       await fetchScanResults(selectedFile?.path || null, { resetManualStatuses: true });
     } catch (err) {
       alert(`重新扫描失败: ${err.message}`);
     } finally {
-      setLoading(false);
+      setScanning(false);
     }
   };
 
@@ -2442,6 +2454,7 @@ export default function App() {
           onSelectFile={handleSelectFile}
           merging={merging}
           onMergeGroup={handleMergeGroup}
+          scanning={scanning}
         />
 
         <div className="flex-1 flex flex-col bg-slate-950 overflow-hidden">
@@ -2537,8 +2550,17 @@ export default function App() {
             </>
           ) : (
             <div className="flex-1 flex flex-col items-center justify-center text-slate-700">
-              <div className="bg-slate-900 p-8 rounded-full mb-4 border border-slate-800 shadow-inner"><FileText size={48} className="opacity-20" /></div>
-              <p className="text-sm font-medium">请从左侧列表选择待审核的文件</p>
+              {scanning ? (
+                <>
+                  <Loader2 className="w-12 h-12 animate-spin text-blue-500 mb-4" />
+                  <p className="text-sm font-medium text-slate-400">正在扫描文件，请稍候...</p>
+                </>
+              ) : (
+                <>
+                  <div className="bg-slate-900 p-8 rounded-full mb-4 border border-slate-800 shadow-inner"><FileText size={48} className="opacity-20" /></div>
+                  <p className="text-sm font-medium">请从左侧列表选择待审核的文件</p>
+                </>
+              )}
             </div>
           )}
         </div>

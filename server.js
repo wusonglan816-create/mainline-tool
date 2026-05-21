@@ -24,7 +24,7 @@ app.use(express.json({ limit: '20mb' }));
 const CONFIG_PATH = path.join(__dirname, 'mainline-tool.config.json');
 const DEFAULT_CONFIG = {
   sourceDir: '/home/wsl/Work_space/MTK_V/mainline_v_2025_oct_14238457',
-  projectDir: '/home/wsl/Work_space/MTK_V/alps-release-v0.mp1.rc-default/alps',
+  projectDir: '',///home/wsl/Work_space/MTK_V/alps-release-v0.mp1.rc-default/alps
   noteProjectKey: '',
   noteProjectKeys: [],
   manualStatuses: {},
@@ -50,6 +50,8 @@ const NOTE_DB_URL = (
 ).trim();
 const NOTE_TABLE_NAME = 'header_notes';
 const NOTE_CONTENT_MAX_LENGTH = 20000;
+const NOTE_DB_CONNECTION_TIMEOUT_MS = 3000;
+const NOTE_DB_QUERY_TIMEOUT_MS = 5000;
 
 let notesDbPool = null;
 let notesTableReady = false;
@@ -171,6 +173,15 @@ function toReadableDatabaseError(err) {
   const hostname = getDatabaseHostname(NOTE_DB_URL);
 
   if (
+    err?.code === 'ETIMEDOUT' ||
+    err?.code === 'ECONNRESET' ||
+    message.includes('timeout') ||
+    message.includes('Connection terminated unexpectedly')
+  ) {
+    return `备注数据库暂时不可达，请检查连接串或网络。当前配置主机: ${hostname || 'unknown'}`;
+  }
+
+  if (
     isSupabaseDirectDatabaseHost(hostname) &&
     (
       err?.code === 'ENETUNREACH' ||
@@ -198,8 +209,15 @@ function getNotesDbPool() {
     notesDbPool = new Pool({
       connectionString: NOTE_DB_URL,
       max: 10,
+      connectionTimeoutMillis: NOTE_DB_CONNECTION_TIMEOUT_MS,
       idleTimeoutMillis: 30000,
+      query_timeout: NOTE_DB_QUERY_TIMEOUT_MS,
+      statement_timeout: NOTE_DB_QUERY_TIMEOUT_MS,
       ssl: shouldUseDatabaseSsl(NOTE_DB_URL) ? { rejectUnauthorized: false } : undefined,
+    });
+
+    notesDbPool.on('error', (err) => {
+      console.error('[header-note] notes db pool error:', err);
     });
   }
 
@@ -255,13 +273,54 @@ async function ensureNotesTable() {
 }
 
 async function withNotesDbSession(callback) {
-  const pool = await ensureNotesTable();
-  const client = await pool.connect();
-  try {
-    return await callback(client);
-  } finally {
-    client.release();
+  let lastError = null;
+
+  for (let attempt = 1; attempt <= 2; attempt += 1) {
+    try {
+      const pool = await ensureNotesTable();
+      const client = await pool.connect();
+      try {
+        return await callback(client);
+      } finally {
+        client.release();
+      }
+    } catch (err) {
+      lastError = err;
+      const shouldRetry = (
+        attempt < 2 &&
+        (
+          err?.code === 'EAI_AGAIN' ||
+          err?.code === 'ECONNRESET' ||
+          err?.code === 'ETIMEDOUT'
+        )
+      );
+
+      if (shouldRetry) {
+        notesDbPool?.end().catch(() => {});
+        notesDbPool = null;
+        notesTableReady = false;
+        notesTableReadyPromise = null;
+        continue;
+      }
+
+      throw err;
+    }
   }
+
+  throw lastError;
+}
+
+function resolveNoteReadScope(input = {}) {
+  const config = loadConfig();
+  const projectKey = typeof input.projectKey === 'string' && input.projectKey.trim()
+    ? input.projectKey.trim()
+    : (config.noteProjectKey || '').trim();
+
+  if (!projectKey) {
+    throw new Error('请先选择备注类型（noteProjectKey）');
+  }
+
+  return { projectKey };
 }
 
 function resolveNoteScope(input = {}) {
@@ -999,7 +1058,7 @@ app.delete('/api/note-types', async (req, res) => {
 
 app.get('/api/header-note', async (req, res) => {
   try {
-    const scope = resolveNoteScope(req.query);
+    const scope = resolveNoteReadScope(req.query);
     const note = await withNotesDbSession(async (client) => {
       const { rows } = await client.query(
         `
@@ -1020,6 +1079,7 @@ app.get('/api/header-note', async (req, res) => {
       updatedAt: note?.updated_at || null,
     });
   } catch (err) {
+    console.error('[header-note] read failed:', err);
     res.status(hasNoteDatabaseConfig() ? 500 : 503).json({ error: toReadableDatabaseError(err) });
   }
 });
@@ -1061,6 +1121,7 @@ app.post('/api/header-note', async (req, res) => {
       updatedAt: note.updated_at,
     });
   } catch (err) {
+    console.error('[header-note] save failed:', err);
     res.status(hasNoteDatabaseConfig() ? 500 : 503).json({ error: toReadableDatabaseError(err) });
   }
 });

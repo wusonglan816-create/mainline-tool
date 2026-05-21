@@ -10,3 +10,4 @@ Thumbs.db
 mainline-tool.config.json
 .env
 .env.local
+.gstack/
