@@ -11,3 +11,5 @@ mainline-tool.config.json
 .env
 .env.local
 .gstack/
+.claude/
+skills/

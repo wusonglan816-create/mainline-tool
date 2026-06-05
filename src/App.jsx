@@ -845,10 +845,12 @@ function LoadingScreen() {
 function NoteFullscreenOverlay({
   open,
   noteContent,
+  noteError,
   noteLoading,
   noteSaving,
   onNoteChange,
   onNoteSave,
+  onNoteRetry,
   onClose,
 }) {
   if (!open) return null;
@@ -876,8 +878,17 @@ function NoteFullscreenOverlay({
               </button>
               <button
                 type="button"
-                onClick={onNoteSave}
+                onClick={onNoteRetry}
                 disabled={noteBusy}
+                className="inline-flex h-9 items-center gap-1.5 rounded-lg border border-slate-700 px-3 text-xs font-medium text-amber-200 transition hover:border-amber-400/40 hover:text-amber-100 disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                {noteLoading ? <Loader2 size={12} className="animate-spin" /> : <RefreshCw size={12} />}
+                重试
+              </button>
+              <button
+                type="button"
+                onClick={onNoteSave}
+                disabled={noteBusy || Boolean(noteError)}
                 className="inline-flex h-9 items-center gap-1.5 rounded-lg border border-slate-700 px-3 text-xs font-medium text-slate-200 transition hover:border-emerald-400/40 hover:text-emerald-200 disabled:cursor-not-allowed disabled:opacity-60"
               >
                 {noteBusy ? <Loader2 size={12} className="animate-spin" /> : <Save size={12} />}
@@ -894,6 +905,11 @@ function NoteFullscreenOverlay({
             </div>
           </div>
         </div>
+        {noteError ? (
+          <div className="border-b border-amber-500/20 bg-amber-500/10 px-5 py-2 text-xs text-amber-100">
+            {noteError}
+          </div>
+        ) : null}
         <div className="flex-1 min-h-0 p-4">
           <textarea
             value={noteContent || ''}
@@ -1007,6 +1023,7 @@ function AppHeader({
   noteProjectKeyInput,
   noteTypeOptions,
   noteContent,
+  noteError,
   noteLoading,
   noteSaving,
   noteTypePending,
@@ -1015,6 +1032,7 @@ function AppHeader({
   onOpenNoteExpand,
   onNoteChange,
   onNoteSave,
+  onNoteRetry,
   onMergeAll,
 }) {
   const noteBusy = noteLoading || noteSaving || noteTypePending;
@@ -1035,75 +1053,90 @@ function AppHeader({
       </div>
 
       <div className="flex flex-col items-stretch gap-3 xl:flex-row xl:items-center xl:justify-end">
-        <div className="flex h-15 items-center gap-2 xl:w-[820px]">
-          <span className="shrink-0 text-xs font-semibold tracking-[0.18em] text-amber-400">
-            备注类型
-          </span>
-          <select
-            value={noteProjectKeyInput || ''}
-            onChange={onProjectKeyChange}
-            disabled={noteBusy}
-            className="h-10 w-[220px] shrink-0 rounded-lg border border-slate-700 bg-slate-950 px-3 text-xs text-amber-200 outline-none transition focus:border-amber-400/50 disabled:cursor-wait disabled:opacity-60"
-          >
-            <option value="">请选择备注类型</option>
-            {noteTypeOptions.map((item) => (
-              <option key={item} value={item}>
-                {item}
-              </option>
-            ))}
-          </select>
-          <button
-            type="button"
-            onClick={onOpenNoteTypeManager}
-            disabled={noteBusy}
-            className="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-lg border border-slate-700 text-slate-300 transition hover:border-amber-400/40 hover:text-amber-200 disabled:cursor-not-allowed disabled:opacity-60"
-            title="管理备注类型"
-          >
-            <Plus size={14} />
-          </button>
-          <span className="shrink-0 text-xs font-semibold tracking-[0.18em] text-red-400">
-            备注
-          </span>
-          <div className="relative h-10 min-w-0 max-w-[50ch] flex-1">
-            <textarea
-              value={noteContent || ''}
-              onChange={onNoteChange}
+        <div className="flex min-h-15 flex-col justify-center gap-1 xl:w-[820px]">
+          <div className="flex items-center gap-2">
+            <span className="shrink-0 text-xs font-semibold tracking-[0.18em] text-amber-400">
+              备注类型
+            </span>
+            <select
+              value={noteProjectKeyInput || ''}
+              onChange={onProjectKeyChange}
               disabled={noteBusy}
-              spellCheck={false}
-              rows={2}
-              wrap="soft"
-              className="h-10 w-full resize-none overflow-y-auto rounded-lg border border-slate-700 bg-slate-950 px-3 py-1.5 pr-9 text-xs leading-5 text-red-400 font-mono outline-none transition placeholder:text-slate-500 focus:border-red-400/50 disabled:cursor-wait disabled:opacity-60 [&::-webkit-scrollbar]:hidden"
-              placeholder={noteLoading ? '正在读取备注...' : '输入需要保存到数据库的备注内容'}
-              style={{ scrollbarWidth: 'none', msOverflowStyle: 'none' }}
-            />
+              className="h-10 w-[220px] shrink-0 rounded-lg border border-slate-700 bg-slate-950 px-3 text-xs text-amber-200 outline-none transition focus:border-amber-400/50 disabled:cursor-wait disabled:opacity-60"
+            >
+              <option value="">请选择备注类型</option>
+              {noteTypeOptions.map((item) => (
+                <option key={item} value={item}>
+                  {item}
+                </option>
+              ))}
+            </select>
             <button
               type="button"
-              onClick={onOpenNoteExpand}
+              onClick={onOpenNoteTypeManager}
               disabled={noteBusy}
-              className="absolute bottom-1 right-1 inline-flex h-6 w-6 items-center justify-center rounded-md border border-slate-700 bg-slate-900/90 text-slate-400 transition hover:border-red-400/40 hover:text-red-200 disabled:cursor-not-allowed disabled:opacity-60"
-              title="放大查看备注"
+              className="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-lg border border-slate-700 text-slate-300 transition hover:border-amber-400/40 hover:text-amber-200 disabled:cursor-not-allowed disabled:opacity-60"
+              title="管理备注类型"
             >
-              <Maximize2 size={11} />
+              <Plus size={14} />
+            </button>
+            <span className="shrink-0 text-xs font-semibold tracking-[0.18em] text-red-400">
+              备注
+            </span>
+            <div className="relative h-10 min-w-0 max-w-[50ch] flex-1">
+              <textarea
+                value={noteContent || ''}
+                onChange={onNoteChange}
+                disabled={noteBusy}
+                spellCheck={false}
+                rows={2}
+                wrap="soft"
+                className="h-10 w-full resize-none overflow-y-auto rounded-lg border border-slate-700 bg-slate-950 px-3 py-1.5 pr-9 text-xs leading-5 text-red-400 font-mono outline-none transition placeholder:text-slate-500 focus:border-red-400/50 disabled:cursor-wait disabled:opacity-60 [&::-webkit-scrollbar]:hidden"
+                placeholder={noteLoading ? '正在读取备注...' : '输入需要保存到数据库的备注内容'}
+                style={{ scrollbarWidth: 'none', msOverflowStyle: 'none' }}
+              />
+              <button
+                type="button"
+                onClick={onOpenNoteExpand}
+                disabled={noteBusy}
+                className="absolute bottom-1 right-1 inline-flex h-6 w-6 items-center justify-center rounded-md border border-slate-700 bg-slate-900/90 text-slate-400 transition hover:border-red-400/40 hover:text-red-200 disabled:cursor-not-allowed disabled:opacity-60"
+                title="放大查看备注"
+              >
+                <Maximize2 size={11} />
+              </button>
+            </div>
+            <button
+              type="button"
+              onClick={() => copyTextWithFeedback(noteContent, '备注内容已复制')}
+              disabled={noteBusy}
+              className="inline-flex h-10 shrink-0 items-center gap-1.5 rounded-lg border border-slate-700 px-3 text-[11px] font-medium text-slate-300 transition hover:border-red-400/40 hover:text-red-200 disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              <Copy size={12} />
+              复制
+            </button>
+            <button
+              type="button"
+              onClick={onNoteSave}
+              disabled={noteBusy || Boolean(noteError)}
+              className="inline-flex h-10 shrink-0 items-center gap-1.5 rounded-lg border border-slate-700 px-3 text-[11px] font-medium text-slate-200 transition hover:border-emerald-400/40 hover:text-emerald-200 disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              {noteBusy ? <Loader2 size={12} className="animate-spin" /> : <Save size={12} />}
+              {noteLoading ? '加载中' : '保存'}
             </button>
           </div>
-          <button
-            type="button"
-            onClick={() => copyTextWithFeedback(noteContent, '备注内容已复制')}
-            disabled={noteBusy}
-            className="inline-flex h-10 shrink-0 items-center gap-1.5 rounded-lg border border-slate-700 px-3 text-[11px] font-medium text-slate-300 transition hover:border-red-400/40 hover:text-red-200 disabled:cursor-not-allowed disabled:opacity-60"
-          >
-            <Copy size={12} />
-            复制
-          </button>
-          <button
-            type="button"
-            onClick={onNoteSave}
-            disabled={noteBusy}
-            className="inline-flex h-10 shrink-0 items-center gap-1.5 rounded-lg border border-slate-700 px-3 text-[11px] font-medium text-slate-200 transition hover:border-emerald-400/40 hover:text-emerald-200 disabled:cursor-not-allowed disabled:opacity-60"
-          >
-            {noteBusy ? <Loader2 size={12} className="animate-spin" /> : <Save size={12} />}
-            {noteLoading ? '加载中' : '保存'}
-          </button>
+          {noteError ? (
+            <div className="flex items-center gap-2 text-[11px] text-amber-200 xl:pl-[356px]">
+              <span className="min-w-0 truncate">{noteError}</span>
+              <button
+                type="button"
+                onClick={onNoteRetry}
+                disabled={noteBusy}
+                className="shrink-0 rounded border border-amber-400/30 px-2 py-0.5 text-amber-100 transition hover:border-amber-300/60 hover:text-white disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                重试
+              </button>
+            </div>
+          ) : null}
         </div>
 
         <button
@@ -1561,6 +1594,7 @@ export default function App() {
   const [commitDetailError, setCommitDetailError] = useState('');
   const [commitDetail, setCommitDetail] = useState(null);
   const [headerNote, setHeaderNote] = useState('');
+  const [noteError, setNoteError] = useState('');
   const [noteLoading, setNoteLoading] = useState(false);
   const [noteSaving, setNoteSaving] = useState(false);
   const [noteExpanded, setNoteExpanded] = useState(false);
@@ -1656,11 +1690,13 @@ export default function App() {
 
     if (!projectKey) {
       setHeaderNote('');
+      setNoteError('');
       return '';
     }
 
     try {
       setNoteLoading(true);
+      setNoteError('');
       const query = new URLSearchParams({ projectKey });
       const res = await fetch(`/api/header-note?${query.toString()}`);
       const data = await readJsonResponse(res, '读取备注接口返回了非 JSON 响应，请检查后端服务');
@@ -1669,8 +1705,8 @@ export default function App() {
       }
       setHeaderNote(data.noteContent || '');
       return data.noteContent || '';
-    } catch {
-      setHeaderNote('');
+    } catch (err) {
+      setNoteError(`备注读取失败，已保留当前显示内容。${err.message}`);
       return '';
     } finally {
       setNoteLoading(false);
@@ -1932,6 +1968,7 @@ export default function App() {
       setActiveConfig({ ...data, manualStatuses: {} });
       setNoteProjectKeyInput(data.noteProjectKey || '');
       setNoteTypeOptions(data.noteProjectKeys || []);
+      await fetchHeaderNote(data);
       try {
         setScanning(true);
         await fetchScanResults(selectedFile?.path || null, { resetManualStatuses: true });
@@ -2015,12 +2052,20 @@ export default function App() {
       const data = await readJsonResponse(res, '保存备注接口返回了非 JSON 响应，请检查后端服务');
       if (!res.ok) throw new Error(data.error || '保存备注失败');
       setHeaderNote(data.noteContent || '');
+      setNoteError('');
       alert('备注已保存到数据库。');
     } catch (err) {
       alert(`保存备注失败: ${err.message}`);
     } finally {
       setNoteSaving(false);
     }
+  };
+
+  const handleRetryHeaderNote = async () => {
+    await fetchHeaderNote({
+      ...activeConfig,
+      noteProjectKey: noteProjectKeyInput || activeConfig.noteProjectKey,
+    });
   };
 
   const applyNoteTypeConfig = (config) => {
@@ -2394,6 +2439,7 @@ export default function App() {
         noteProjectKeyInput={noteProjectKeyInput}
         noteTypeOptions={noteTypeOptions}
         noteContent={headerNote}
+        noteError={noteError}
         noteLoading={noteLoading}
         noteSaving={noteSaving}
         noteTypePending={noteTypePending}
@@ -2402,6 +2448,7 @@ export default function App() {
         onOpenNoteExpand={() => setNoteExpanded(true)}
         onNoteChange={(event) => setHeaderNote(event.target.value)}
         onNoteSave={handleSaveHeaderNote}
+        onNoteRetry={handleRetryHeaderNote}
         onMergeAll={handleMergeAction}
       />
       <PathConfigSection
@@ -2431,10 +2478,12 @@ export default function App() {
       <NoteFullscreenOverlay
         open={noteExpanded}
         noteContent={headerNote}
+        noteError={noteError}
         noteLoading={noteLoading}
         noteSaving={noteSaving}
         onNoteChange={(event) => setHeaderNote(event.target.value)}
         onNoteSave={handleSaveHeaderNote}
+        onNoteRetry={handleRetryHeaderNote}
         onClose={() => setNoteExpanded(false)}
       />
 
