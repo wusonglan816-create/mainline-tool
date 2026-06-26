@@ -466,15 +466,30 @@ function listImmediateDirectories(dirPath) {
     .sort((left, right) => path.basename(left).localeCompare(path.basename(right)));
 }
 
-function pickTwoReferenceDirectories(monthDir, label, warnings) {
+function isMonthDirectoryName(name) {
+  return /^\d{4}-\d{2}$/.test(name);
+}
+
+function listReferenceMonthsBefore(rootDir, selectedMonth) {
+  return listImmediateDirectories(rootDir)
+    .map((dirPath) => ({
+      month: path.basename(dirPath),
+      dirPath,
+    }))
+    .filter((item) => isMonthDirectoryName(item.month) && item.month < selectedMonth)
+    .sort((left, right) => right.month.localeCompare(left.month));
+}
+
+function pickTwoReferenceDirectories(monthDir, label, warnings, options = {}) {
   const directories = listImmediateDirectories(monthDir);
+  const messageList = options.messageList || warnings;
   if (directories.length < 2) {
-    warnings.push(`${label}: ${monthDir} 下未找到两个可对比目录`);
+    messageList.push(`${label}: ${monthDir} 下未找到两个可对比目录，已跳过`);
     return null;
   }
 
   if (directories.length > 2) {
-    warnings.push(`${label}: ${monthDir} 下找到 ${directories.length} 个目录，默认使用排序前两个目录对比`);
+    messageList.push(`${label}: ${monthDir} 下找到 ${directories.length} 个目录，默认使用排序前两个目录对比`);
   }
 
   return directories.slice(0, 2);
@@ -819,8 +834,10 @@ function buildReferenceCompareIndex(config) {
     rootDir: referenceConfig.rootDir,
     month: referenceConfig.month,
     warnings: [],
+    notices: [],
     customDiffCount: 0,
     nativeAdditionCount: 0,
+    customComparedMonths: [],
   };
   const index = new Map();
 
@@ -839,20 +856,19 @@ function buildReferenceCompareIndex(config) {
   }
 
   const previousMonth = addMonths(referenceConfig.month, -1);
-  const twoMonthsAgo = addMonths(referenceConfig.month, -2);
+  const customReferenceMonths = listReferenceMonthsBefore(referenceConfig.rootDir, referenceConfig.month);
+  let customComparedMonthCount = 0;
 
-  [previousMonth, twoMonthsAgo].forEach((month) => {
-    const monthDir = path.join(referenceConfig.rootDir, month);
-    if (!fs.existsSync(monthDir)) {
-      report.warnings.push(`未找到上两月客制化参考目录: ${monthDir}`);
-      return;
-    }
-
-    const pair = pickTwoReferenceDirectories(monthDir, `${month} 客制化差异对比`, report.warnings);
+  customReferenceMonths.forEach(({ month, dirPath }) => {
+    const pair = pickTwoReferenceDirectories(dirPath, `${month} 客制化差异对比`, report.warnings, {
+      messageList: report.notices,
+    });
     if (!pair) {
       return;
     }
 
+    customComparedMonthCount += 1;
+    report.customComparedMonths.push(month);
     compareReferenceDirectories(pair[0], pair[1]).forEach((diff) => {
       addReferenceHit(index, diff.relativePath, {
         type: 'custom',
@@ -865,6 +881,10 @@ function buildReferenceCompareIndex(config) {
       report.customDiffCount += 1;
     });
   });
+
+  if (customComparedMonthCount === 0) {
+    report.warnings.push(`未找到可执行的客制化参考对比: ${referenceConfig.rootDir} 下没有早于 ${referenceConfig.month} 且包含两个可对比目录的月份文件夹`);
+  }
 
   const currentMonthDir = path.join(referenceConfig.rootDir, referenceConfig.month);
   if (!fs.existsSync(currentMonthDir)) {

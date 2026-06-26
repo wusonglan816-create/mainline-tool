@@ -638,8 +638,8 @@ function DiffCell({
 }) {
   const isPlaceholder = rowType === 'placeholder' || rowType === 'gap';
   const rowToneClass = rowType === 'added' || rowType === 'removed' || rowType === 'placeholder'
-      ? 'bg-red-500/5'
-      : '';
+    ? highlightTone === 'warning' ? 'bg-amber-500/10' : 'bg-red-500/5'
+    : '';
   const segments = rowType === 'changed'
     ? getChangedSegments(text, otherText)
     : [{ text, changed: rowType === 'added' || rowType === 'removed' }];
@@ -648,15 +648,12 @@ function DiffCell({
       return 'text-slate-400';
     }
 
-    if (rowType === 'added' || rowType === 'removed') {
-      if (highlightTone === 'warning' && rowType === 'added') {
-        return 'text-amber-100 bg-amber-500/20 rounded-sm';
-      }
-      return 'text-red-200 bg-red-500/15 rounded-sm';
-    }
-
     if (highlightTone === 'warning') {
       return 'text-amber-100 bg-amber-500/20 rounded-sm';
+    }
+
+    if (rowType === 'added' || rowType === 'removed') {
+      return 'text-red-200 bg-red-500/15 rounded-sm';
     }
 
     return 'text-red-300 bg-red-500/15 rounded-sm';
@@ -669,7 +666,7 @@ function DiffCell({
       </span>
       <span className="flex-1 whitespace-pre text-[13px] font-mono leading-relaxed text-slate-400 min-w-0">
         {isPlaceholder ? (
-          <span className={rowType === 'placeholder' ? 'inline-block min-w-4 text-red-200/40' : 'text-slate-700'}>
+          <span className={rowType === 'placeholder' ? `inline-block min-w-4 ${highlightTone === 'warning' ? 'text-amber-200/70' : 'text-red-200/40'}` : 'text-slate-700'}>
             {emptyLabel || ' '}
           </span>
         ) : editable ? (
@@ -746,6 +743,7 @@ function ComparePane({
                 editable={editing && row.leftNumber !== null}
                 onTextChange={(nextText) => onLineChange?.(row.leftNumber, nextText)}
                 onEditorKeyDown={(event) => onLineKeyDown?.(row.leftNumber, event)}
+                highlightTone={highlightRowIndexes.has(actualIndex) ? 'warning' : 'default'}
               />
             ) : (
               <DiffCell
@@ -869,6 +867,7 @@ function CompareWorkspace({
         badge={selectedDisplay.status === 'danger' ? <span className="bg-red-500/20 text-red-500 px-2 py-0.5 rounded text-[10px] border border-red-500/30">检测到冲突</span> : selectedDisplay.status === 'warning' ? <span className="bg-amber-500/20 text-amber-300 px-2 py-0.5 rounded text-[10px] border border-amber-500/30">客制化参考</span> : null}
         rows={selectedDiffRows}
         side="left"
+        highlightRowIndexes={nativeAdditionHighlightRows}
         paneRef={leftPaneRef}
         onScroll={onLeftScroll}
         editing={editingTarget}
@@ -1348,12 +1347,20 @@ function PathConfigSection({
             <span className="rounded border border-amber-500/20 bg-amber-500/10 px-2 py-1 text-amber-200">
               当前命中客制 {referenceCompareReport.customDiffMatchedCount || 0} 文件 / 黄色人工 {referenceCompareReport.customDiffWarningCount || 0}
             </span>
+            <span className="rounded border border-amber-500/20 bg-amber-500/10 px-2 py-1 text-amber-200">
+              已查客制月份 {(referenceCompareReport.customComparedMonths || []).join('、') || '-'}
+            </span>
             <span className="rounded border border-blue-500/20 bg-blue-500/10 px-2 py-1 text-blue-200">
               参考原生新增 {referenceCompareReport.nativeAdditionCount || 0} 条
             </span>
             <span className="rounded border border-blue-500/20 bg-blue-500/10 px-2 py-1 text-blue-200">
               当前命中原生新增 {referenceCompareReport.nativeAdditionMatchedCount || 0} 文件
             </span>
+            {(referenceCompareReport.notices || []).map((notice) => (
+              <span key={notice} className="rounded border border-slate-500/20 bg-slate-500/10 px-2 py-1 text-slate-300">
+                {notice}
+              </span>
+            ))}
             {(referenceCompareReport.warnings || []).map((warning) => (
               <span key={warning} className="rounded border border-red-500/20 bg-red-500/10 px-2 py-1 text-red-200">
                 {warning}
