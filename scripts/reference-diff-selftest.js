@@ -17,9 +17,9 @@ assert.deepEqual(
 );
 
 assert.deepEqual(
-  blocks('A\nMOVED\nB', 'MOVED\nA\nB'),
-  [],
-  'moved existing lines should not be treated as native additions'
+  blocks('A\nREAD_PRIVILEGED_PHONE_STATE\nB', 'A\nB\nREAD_PRIVILEGED_PHONE_STATE'),
+  [['READ_PRIVILEGED_PHONE_STATE']],
+  'reordered permission lines on the new side should be highlighted as monthly native diff'
 );
 
 assert.deepEqual(
@@ -52,6 +52,22 @@ if (fs.existsSync(oldMainline) && fs.existsSync(newMainline)) {
     mainlineAddedLines.includes('# Allow dexopt files that are side-effects of already allowlisted files.'),
     true,
     'real dexopt native addition block should be preserved'
+  );
+}
+
+const oldPrivappPermissions = '/media/wsl/jixie/资源/2026-06/gms-oem-V-15-202605/partner_gms/etc/permissions/privapp-permissions-google-product.xml';
+const newPrivappPermissions = '/media/wsl/jixie/资源/2026-06/gms-oem-V-15-202606/partner_gms/etc/permissions/privapp-permissions-google-product.xml';
+
+if (fs.existsSync(oldPrivappPermissions) && fs.existsSync(newPrivappPermissions)) {
+  const privappAddedLines = flatten(blocks(
+    fs.readFileSync(oldPrivappPermissions, 'utf8'),
+    fs.readFileSync(newPrivappPermissions, 'utf8')
+  ));
+
+  assert.equal(
+    privappAddedLines.includes('        <permission name="android.permission.READ_PRIVILEGED_PHONE_STATE"/>'),
+    true,
+    'READ_PRIVILEGED_PHONE_STATE should be highlighted when it appears on the new side of the monthly diff'
   );
 }
 

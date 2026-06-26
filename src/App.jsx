@@ -123,7 +123,7 @@ function getStatusBadgeClass(status) {
 }
 
 function normalizeReferenceLine(line = '') {
-  return line.endsWith('\r') ? line.slice(0, -1) : line;
+  return (line.endsWith('\r') ? line.slice(0, -1) : line).trim();
 }
 
 function getNativeAdditionLineBlocks(referenceInfo) {
@@ -139,61 +139,154 @@ function getNativeAdditionLineBlocks(referenceInfo) {
   });
 }
 
-function tryMatchNativeAdditionBlock(rows, startIndex, block) {
-  const matchedIndexes = [];
-  let blockIndex = 0;
-  let rowIndex = startIndex;
+function getNativeRemovalLineBlocks(referenceInfo) {
+  return (referenceInfo?.nativeAdditions || []).flatMap((item) => {
+    const blocks = Array.isArray(item.removedLineBlocks) && item.removedLineBlocks.length > 0
+      ? item.removedLineBlocks
+      : [];
+    return blocks.map((block) => (
+      block
+        .map((line) => normalizeReferenceLine(line))
+        .filter((line) => line.trim())
+    )).filter((block) => block.length > 0);
+  });
+}
 
-  while (rowIndex < rows.length && blockIndex < block.length) {
-    const row = rows[rowIndex];
-    const canHighlightRow = row.type === 'added' || row.type === 'changed';
-    const rightText = normalizeReferenceLine(row.rightText || '');
-
-    if (!canHighlightRow) {
-      return null;
+function buildReferenceLineCounts(blocks) {
+  const counts = new Map();
+  blocks.flat().forEach((line) => {
+    const normalized = normalizeReferenceLine(line);
+    if (!normalized) {
+      return;
     }
+    counts.set(normalized, (counts.get(normalized) || 0) + 1);
+  });
+  return counts;
+}
 
-    if (!rightText.trim()) {
-      rowIndex += 1;
+function getReferenceCandidateLines(row) {
+  const candidates = [
+    normalizeReferenceLine(row.rightText || ''),
+    normalizeReferenceLine(row.leftText || ''),
+  ].filter(Boolean);
+
+  return Array.from(new Set(candidates));
+}
+
+function consumeReferenceLineMatch(counts, row) {
+  const candidates = getReferenceCandidateLines(row);
+
+  for (const line of candidates) {
+    const count = counts.get(line) || 0;
+    if (count <= 0) {
       continue;
     }
 
-    if (rightText !== block[blockIndex]) {
-      return null;
-    }
-
-    matchedIndexes.push(rowIndex);
-    blockIndex += 1;
-    rowIndex += 1;
+    counts.set(line, count - 1);
+    return line;
   }
 
-  return blockIndex === block.length ? matchedIndexes : null;
+  return null;
 }
 
-function buildNativeAdditionHighlightRows(rows = [], referenceInfo = null) {
-  const blocks = getNativeAdditionLineBlocks(referenceInfo);
+function isDiffRow(row) {
+  return row?.type === 'added' || row?.type === 'changed' || row?.type === 'removed';
+}
+
+function isBlankDiffRow(row) {
+  return isDiffRow(row)
+    && !normalizeReferenceLine(row.leftText || '')
+    && !normalizeReferenceLine(row.rightText || '');
+}
+
+function expandBlankReferenceRows(rows, highlightedRows) {
+  const expandedRows = new Set(highlightedRows);
+  const queue = Array.from(highlightedRows);
+
+  while (queue.length > 0) {
+    const index = queue.shift();
+    [index - 1, index + 1].forEach((candidateIndex) => {
+      if (
+        candidateIndex < 0
+        || candidateIndex >= rows.length
+        || expandedRows.has(candidateIndex)
+        || !isBlankDiffRow(rows[candidateIndex])
+      ) {
+        return;
+      }
+
+      expandedRows.add(candidateIndex);
+      queue.push(candidateIndex);
+    });
+  }
+
+  return expandedRows;
+}
+
+const MIRROR_REFERENCE_ROW_WINDOW = 8;
+
+function findMirrorReferenceRow(rows, sourceIndex, line, mirrorTypes, highlightedRows) {
+  if (mirrorTypes.length === 0) {
+    return null;
+  }
+
+  const start = Math.max(0, sourceIndex - MIRROR_REFERENCE_ROW_WINDOW);
+  const end = Math.min(rows.length - 1, sourceIndex + MIRROR_REFERENCE_ROW_WINDOW);
+
+  let bestIndex = null;
+  for (let index = start; index <= end; index += 1) {
+    if (index === sourceIndex || highlightedRows.has(index) || !mirrorTypes.includes(rows[index].type)) {
+      continue;
+    }
+
+    if (!getReferenceCandidateLines(rows[index]).includes(line)) {
+      continue;
+    }
+
+    if (bestIndex === null || Math.abs(index - sourceIndex) < Math.abs(bestIndex - sourceIndex)) {
+      bestIndex = index;
+    }
+  }
+
+  return bestIndex;
+}
+
+function buildNativeReferenceHighlightRows(rows = [], blocks = [], preferredTypes = [], mirrorTypes = []) {
+  const counts = buildReferenceLineCounts(blocks);
   const highlightedRows = new Set();
 
-  if (blocks.length === 0) {
+  if (counts.size === 0) {
     return highlightedRows;
   }
 
-  let searchStart = 0;
-
-  blocks.forEach((block) => {
-    for (let index = searchStart; index < rows.length; index += 1) {
-      const matchedIndexes = tryMatchNativeAdditionBlock(rows, index, block);
-      if (!matchedIndexes) {
-        continue;
+  const matchRowsByType = (types) => {
+    rows.forEach((row, index) => {
+      if (highlightedRows.has(index) || !types.includes(row.type)) {
+        return;
       }
+      const matchedLine = consumeReferenceLineMatch(counts, row);
+      if (matchedLine) {
+        highlightedRows.add(index);
+        const mirrorIndex = findMirrorReferenceRow(rows, index, matchedLine, mirrorTypes, highlightedRows);
+        if (mirrorIndex !== null) {
+          highlightedRows.add(mirrorIndex);
+        }
+      }
+    });
+  };
 
-      matchedIndexes.forEach((matchedIndex) => highlightedRows.add(matchedIndex));
-      searchStart = matchedIndexes[matchedIndexes.length - 1] + 1;
-      break;
-    }
-  });
+  matchRowsByType(preferredTypes);
+  matchRowsByType(['added', 'changed', 'removed'].filter((type) => !preferredTypes.includes(type)));
 
-  return highlightedRows;
+  return expandBlankReferenceRows(rows, highlightedRows);
+}
+
+function buildNativeAdditionHighlightRows(rows = [], referenceInfo = null) {
+  return buildNativeReferenceHighlightRows(rows, getNativeAdditionLineBlocks(referenceInfo), ['added', 'changed'], ['removed']);
+}
+
+function buildNativeRemovalHighlightRows(rows = [], referenceInfo = null) {
+  return buildNativeReferenceHighlightRows(rows, getNativeRemovalLineBlocks(referenceInfo), ['removed', 'changed'], ['added']);
 }
 
 function isBlankLine(line = '') {
@@ -712,6 +805,7 @@ function ComparePane({
   rows,
   side,
   highlightRowIndexes = new Set(),
+  removalHighlightRowIndexes = new Set(),
   paneRef,
   onScroll,
   editing = false,
@@ -727,6 +821,9 @@ function ComparePane({
       {topSpacerHeight > 0 && <div style={{ height: topSpacerHeight }} />}
       {visibleRows.map((row, visibleIndex) => {
         const actualIndex = virtualRange ? virtualRange.start + visibleIndex : visibleIndex;
+        const isAdditionHighlight = highlightRowIndexes.has(actualIndex);
+        const isRemovalHighlight = removalHighlightRowIndexes.has(actualIndex);
+        const highlightTone = isAdditionHighlight || isRemovalHighlight ? 'warning' : 'default';
         return (
           <div
             key={actualIndex}
@@ -743,7 +840,7 @@ function ComparePane({
                 editable={editing && row.leftNumber !== null}
                 onTextChange={(nextText) => onLineChange?.(row.leftNumber, nextText)}
                 onEditorKeyDown={(event) => onLineKeyDown?.(row.leftNumber, event)}
-                highlightTone={highlightRowIndexes.has(actualIndex) ? 'warning' : 'default'}
+                highlightTone={highlightTone}
               />
             ) : (
               <DiffCell
@@ -752,7 +849,7 @@ function ComparePane({
                 rowType={row.type === 'removed' ? 'placeholder' : row.type}
                 otherText={row.leftText}
                 emptyLabel={row.type === 'gap' ? '...' : ''}
-                highlightTone={highlightRowIndexes.has(actualIndex) ? 'warning' : 'default'}
+                highlightTone={highlightTone}
               />
             )}
           </div>
@@ -777,7 +874,7 @@ function ComparePane({
   );
 }
 
-function DiffOverviewBar({ rows, activeIndex, onJump }) {
+function DiffOverviewBar({ rows, activeIndex, onJump, highlightRowIndexes = new Set() }) {
   const diffRows = useMemo(() => (
     rows
       .map((row, index) => ({ row, index }))
@@ -790,7 +887,8 @@ function DiffOverviewBar({ rows, activeIndex, onJump }) {
         <div className="absolute inset-y-0 left-1/2 w-px -translate-x-1/2 bg-slate-800" />
         {diffRows.map(({ row, index }) => {
           const top = rows.length <= 1 ? 0 : ((index + 0.5) / rows.length) * 100;
-          const active = activeIndex === row.index;
+          const active = activeIndex === index;
+          const highlighted = highlightRowIndexes.has(index);
           const title = row.leftNumber && row.rightNumber
             ? `跳转到差异行: 本地 ${row.leftNumber} / 资源 ${row.rightNumber}`
             : row.leftNumber
@@ -802,7 +900,7 @@ function DiffOverviewBar({ rows, activeIndex, onJump }) {
               key={`${row.type}-${index}`}
               type="button"
               title={title}
-              onClick={() => onJump(row.index)}
+              onClick={() => onJump(index)}
               className={`absolute left-0 right-0 h-3 -translate-y-1/2 cursor-pointer bg-transparent ${
                 active ? 'z-10' : 'z-0'
               }`}
@@ -811,8 +909,12 @@ function DiffOverviewBar({ rows, activeIndex, onJump }) {
               <span
                 className={`absolute left-0 right-0 top-1/2 h-[4px] -translate-y-1/2 border-y transition-all ${
                   active
-                    ? 'bg-red-300 border-red-100 shadow-[0_0_0_1px_rgba(254,202,202,0.55)]'
-                    : 'bg-red-500/85 border-red-300/40 hover:bg-red-400'
+                    ? highlighted
+                      ? 'bg-amber-200 border-amber-100 shadow-[0_0_0_1px_rgba(253,230,138,0.55)]'
+                      : 'bg-red-300 border-red-100 shadow-[0_0_0_1px_rgba(254,202,202,0.55)]'
+                    : highlighted
+                      ? 'bg-amber-400/90 border-amber-200/50 hover:bg-amber-300'
+                      : 'bg-red-500/85 border-red-300/40 hover:bg-red-400'
                 }`}
               />
             </button>
@@ -843,16 +945,25 @@ function CompareWorkspace({
     () => buildNativeAdditionHighlightRows(selectedDiffRows, selectedDisplay?.referenceInfo),
     [selectedDiffRows, selectedDisplay?.referenceInfo]
   );
-  const highlightSourceAdditions = nativeAdditionHighlightRows.size > 0;
+  const nativeRemovalHighlightRows = useMemo(
+    () => buildNativeRemovalHighlightRows(selectedDiffRows, selectedDisplay?.referenceInfo),
+    [selectedDiffRows, selectedDisplay?.referenceInfo]
+  );
+  const nativeReferenceHighlightRows = useMemo(
+    () => new Set([...nativeAdditionHighlightRows, ...nativeRemovalHighlightRows]),
+    [nativeAdditionHighlightRows, nativeRemovalHighlightRows]
+  );
+  const highlightSourceAdditions = nativeReferenceHighlightRows.size > 0;
 
   return (
     <div className="relative h-full min-h-0 flex-1 flex gap-0 overflow-hidden border border-slate-800 rounded-lg shadow-2xl">
       <ComparePane
         title="待合入资源包"
-        badge={highlightSourceAdditions ? <span className="text-amber-300 text-[11px]">参考新增高亮</span> : <span className="text-blue-400 text-[11px]">GMS资源 Package</span>}
+        badge={highlightSourceAdditions ? <span className="text-amber-300 text-[11px]">参考差异高亮</span> : <span className="text-blue-400 text-[11px]">GMS资源 Package</span>}
         rows={selectedDiffRows}
         side="right"
         highlightRowIndexes={nativeAdditionHighlightRows}
+        removalHighlightRowIndexes={nativeRemovalHighlightRows}
         paneRef={rightPaneRef}
         onScroll={onRightScroll}
         virtualRange={virtualRange}
@@ -861,6 +972,7 @@ function CompareWorkspace({
         rows={selectedDiffRows}
         activeIndex={activeDiffIndex}
         onJump={onJumpToDiff}
+        highlightRowIndexes={nativeReferenceHighlightRows}
       />
       <ComparePane
         title="当前本地项目"
@@ -868,6 +980,7 @@ function CompareWorkspace({
         rows={selectedDiffRows}
         side="left"
         highlightRowIndexes={nativeAdditionHighlightRows}
+        removalHighlightRowIndexes={nativeRemovalHighlightRows}
         paneRef={leftPaneRef}
         onScroll={onLeftScroll}
         editing={editingTarget}
@@ -1312,7 +1425,7 @@ function PathConfigSection({
             className="h-4 w-4 rounded border-slate-600 bg-slate-950 accent-amber-500"
           />
           开启客制化参考对比
-          <span className="text-[11px] font-normal text-slate-500">按月份目录识别上两月客制化差异和上月原生新增内容</span>
+          <span className="text-[11px] font-normal text-slate-500">按月份目录识别上两月客制化差异和上月原生差异内容</span>
         </label>
         {referenceCompareEnabled && (
           <div className="mt-3 grid grid-cols-[1fr_180px] gap-3">
@@ -1351,10 +1464,10 @@ function PathConfigSection({
               已查客制月份 {(referenceCompareReport.customComparedMonths || []).join('、') || '-'}
             </span>
             <span className="rounded border border-blue-500/20 bg-blue-500/10 px-2 py-1 text-blue-200">
-              参考原生新增 {referenceCompareReport.nativeAdditionCount || 0} 条
+              参考原生差异 {referenceCompareReport.nativeAdditionCount || 0} 条
             </span>
             <span className="rounded border border-blue-500/20 bg-blue-500/10 px-2 py-1 text-blue-200">
-              当前命中原生新增 {referenceCompareReport.nativeAdditionMatchedCount || 0} 文件
+              当前命中原生差异 {referenceCompareReport.nativeAdditionMatchedCount || 0} 文件
             </span>
             {(referenceCompareReport.notices || []).map((notice) => (
               <span key={notice} className="rounded border border-slate-500/20 bg-slate-500/10 px-2 py-1 text-slate-300">
@@ -1982,8 +2095,7 @@ export default function App() {
     return scanResults.filter((item) => {
       if (item.status === 'same') return false;
       const matchesFilter = filter === 'all'
-        || item.status === filter
-        || (filter === 'danger' && isManualReviewStatus(item.status));
+        || item.status === filter;
       return matchesFilter && item.path.toLowerCase().includes(searchTerm.toLowerCase());
     });
   }, [filter, scanResults, searchTerm]);
@@ -2015,7 +2127,7 @@ export default function App() {
     warningCount,
     updateCount,
   } = useMemo(() => summarizeScanResults(scanResults), [scanResults]);
-  const manualReviewCount = dangerCount + warningCount;
+  const manualReviewCount = dangerCount;
 
   const selectedDisplay = useMemo(() => {
     if (!selectedFile) return null;
@@ -2755,16 +2867,16 @@ export default function App() {
                     {selectedDisplay.status === 'warning' && <ShieldAlert size={16} className="text-amber-300 shrink-0" />}
                   </h3>
                   <p className={`text-xs mt-1 ${selectedDisplay.status === 'danger' ? 'text-red-400 font-medium' : selectedDisplay.status === 'warning' ? 'text-amber-300 font-medium' : 'text-slate-400'}`}>{selectedDisplay.reason}</p>
-                  {selectedDisplay.referenceInfo && (
+                  {selectedDisplay.referenceInfo && selectedDisplay.status !== 'danger' && (
                     <div className="mt-2 flex flex-wrap gap-2 text-[11px]">
-                      {selectedDisplay.referenceInfo.customDiffs?.map((item, index) => (
+                      {selectedDisplay.status === 'warning' && selectedDisplay.referenceInfo.customDiffs?.map((item, index) => (
                         <span key={`custom-${item.month}-${index}`} className="rounded border border-amber-500/25 bg-amber-500/10 px-2 py-1 text-amber-200">
                           {item.month} 客制差异: {item.pair?.join(' vs ')}
                         </span>
                       ))}
                       {selectedDisplay.referenceInfo.nativeAdditions?.map((item, index) => (
                         <span key={`native-${item.month}-${index}`} className="rounded border border-blue-500/25 bg-blue-500/10 px-2 py-1 text-blue-200">
-                          {item.month} 原生新增: {item.pair?.join(' -> ')}
+                          {item.month} 原生差异: {item.pair?.join(' -> ')}
                         </span>
                       ))}
                     </div>

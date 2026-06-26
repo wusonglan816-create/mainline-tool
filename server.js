@@ -542,44 +542,6 @@ function compactAddedLinesToBlock(lines) {
   return block.length > 0 ? [block] : [];
 }
 
-function countNonBlankLines(lines) {
-  const counts = new Map();
-  lines.forEach((line) => {
-    if (!line.trim()) {
-      return;
-    }
-    counts.set(line, (counts.get(line) || 0) + 1);
-  });
-  return counts;
-}
-
-function filterBlocksByAddedLineBudget(blocks, oldLines, newLines) {
-  const oldCounts = countNonBlankLines(oldLines);
-  const newCounts = countNonBlankLines(newLines);
-  const addedBudget = new Map();
-
-  newCounts.forEach((newCount, line) => {
-    const addedCount = newCount - (oldCounts.get(line) || 0);
-    if (addedCount > 0) {
-      addedBudget.set(line, addedCount);
-    }
-  });
-
-  return blocks.map((block) => {
-    const filteredBlock = [];
-    block.forEach((line) => {
-      const budget = addedBudget.get(line) || 0;
-      if (budget <= 0) {
-        return;
-      }
-
-      filteredBlock.push(line);
-      addedBudget.set(line, budget - 1);
-    });
-    return filteredBlock;
-  }).filter((block) => block.length > 0);
-}
-
 function getExactAddedLineBlocks(oldLines, newLines) {
   const oldCount = oldLines.length;
   const newCount = newLines.length;
@@ -750,8 +712,11 @@ function getAnchoredAddedLineBlocks(oldLines, oldStart, oldEnd, newLines, newSta
 function getAddedLineBlocks(oldContent = '', newContent = '') {
   const oldLines = splitContentLines(oldContent);
   const newLines = splitContentLines(newContent);
-  const blocks = getAnchoredAddedLineBlocks(oldLines, 0, oldLines.length, newLines, 0, newLines.length);
-  return filterBlocksByAddedLineBudget(blocks, oldLines, newLines);
+  return getAnchoredAddedLineBlocks(oldLines, 0, oldLines.length, newLines, 0, newLines.length);
+}
+
+function getRemovedLineBlocks(oldContent = '', newContent = '') {
+  return getAddedLineBlocks(newContent, oldContent);
 }
 
 function splitContentLines(content = '') {
@@ -775,8 +740,10 @@ function compareReferenceDirectories(leftDir, rightDir) {
       return {
         relativePath,
         changed: true,
-        addedLines,
-        addedLineBlocks: addedLines.length > 0 ? [addedLines] : [],
+        addedLines: leftExists ? [] : addedLines,
+        addedLineBlocks: leftExists ? [] : (addedLines.length > 0 ? [addedLines] : []),
+        removedLines: leftExists ? addedLines : [],
+        removedLineBlocks: leftExists ? (addedLines.length > 0 ? [addedLines] : []) : [],
         changeType: leftExists ? 'removed-or-custom-only' : 'added-or-custom-only',
       };
     }
@@ -789,16 +756,21 @@ function compareReferenceDirectories(leftDir, rightDir) {
         changed: false,
         addedLines: [],
         addedLineBlocks: [],
+        removedLines: [],
+        removedLineBlocks: [],
         changeType: 'same',
       };
     }
 
     const addedLineBlocks = getAddedLineBlocks(leftContent, rightContent);
+    const removedLineBlocks = getRemovedLineBlocks(leftContent, rightContent);
     return {
       relativePath,
       changed: true,
       addedLines: addedLineBlocks.flat(),
       addedLineBlocks,
+      removedLines: removedLineBlocks.flat(),
+      removedLineBlocks,
       changeType: 'changed',
     };
   }).filter((item) => item.changed);
@@ -810,6 +782,7 @@ function addReferenceHit(index, relativePath, hit) {
       customDiffs: [],
       nativeAdditions: [],
       addedLines: new Set(),
+      removedLines: new Set(),
     });
   }
 
@@ -823,6 +796,12 @@ function addReferenceHit(index, relativePath, hit) {
   (hit.addedLines || []).forEach((line) => {
     if (line.trim()) {
       entry.addedLines.add(line);
+    }
+  });
+
+  (hit.removedLines || []).forEach((line) => {
+    if (line.trim()) {
+      entry.removedLines.add(line);
     }
   });
 }
@@ -877,6 +856,8 @@ function buildReferenceCompareIndex(config) {
         changeType: diff.changeType,
         addedLines: diff.addedLines,
         addedLineBlocks: diff.addedLineBlocks,
+        removedLines: diff.removedLines,
+        removedLineBlocks: diff.removedLineBlocks,
       });
       report.customDiffCount += 1;
     });
@@ -895,7 +876,7 @@ function buildReferenceCompareIndex(config) {
   const orderedPair = pickOrderedNativeDirectories(currentMonthDir, previousMonth, referenceConfig.month, report.warnings);
   if (orderedPair) {
     compareReferenceDirectories(orderedPair.oldDir, orderedPair.newDir).forEach((diff) => {
-      if (diff.addedLines.length === 0 && diff.changeType === 'changed') {
+      if (diff.addedLines.length === 0 && diff.removedLines.length === 0 && diff.changeType === 'changed') {
         return;
       }
 
@@ -906,6 +887,8 @@ function buildReferenceCompareIndex(config) {
         changeType: diff.changeType,
         addedLines: diff.addedLines,
         addedLineBlocks: diff.addedLineBlocks,
+        removedLines: diff.removedLines,
+        removedLineBlocks: diff.removedLineBlocks,
       });
       report.nativeAdditionCount += 1;
     });
@@ -1373,7 +1356,7 @@ function formatReferenceReason(referenceInfo) {
   }
 
   if (referenceInfo.nativeAdditions.length > 0) {
-    parts.push(`上月原生新增参考: ${referenceInfo.nativeAdditions.length} 处`);
+    parts.push(`上月原生差异参考: ${referenceInfo.nativeAdditions.length} 处`);
   }
 
   return parts.join('；');
@@ -1388,6 +1371,7 @@ function serializeReferenceInfo(referenceEntry) {
     customDiffs: referenceEntry.customDiffs,
     nativeAdditions: referenceEntry.nativeAdditions,
     addedLines: Array.from(referenceEntry.addedLines),
+    removedLines: Array.from(referenceEntry.removedLines),
     highlightSourceAdditions: referenceEntry.nativeAdditions.length > 0,
   };
 }
@@ -1397,6 +1381,13 @@ function applyReferenceInfo(summary, referenceInfo) {
     return summary;
   }
 
+  if (summary.status === 'danger') {
+    return {
+      ...summary,
+      referenceInfo,
+    };
+  }
+
   const referenceReason = formatReferenceReason(referenceInfo);
   const nextSummary = {
     ...summary,
@@ -1404,7 +1395,7 @@ function applyReferenceInfo(summary, referenceInfo) {
     reason: referenceReason ? `${summary.reason}。参考对比: ${referenceReason}` : summary.reason,
   };
 
-  if (summary.status !== 'danger' && summary.status !== 'same' && referenceInfo.customDiffs.length > 0) {
+  if (summary.status !== 'same' && referenceInfo.customDiffs.length > 0) {
     return {
       ...nextSummary,
       status: 'warning',
