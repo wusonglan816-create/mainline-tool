@@ -27,6 +27,11 @@ const DEFAULT_CONFIG = {
   projectDir: '',///home/wsl/Work_space/MTK_V/alps-release-v0.mp1.rc-default/alps
   noteProjectKey: '',
   noteProjectKeys: [],
+  referenceCompare: {
+    enabled: false,
+    rootDir: '',
+    month: '',
+  },
   manualStatuses: {},
 };
 const GMS_PATTERN = /(\/\/\[GMS\]\[\d+\]|begin-->|redmine|Redmine|end-->|\[GMS\])/;
@@ -35,6 +40,10 @@ const TEXT_EXTENSIONS = new Set([
   '.list', '.rc', '.md', '.java', '.kt', '.kts', '.c', '.cc', '.cpp', '.h', '.hpp',
   '.py', '.js', '.ts', '.jsx', '.tsx', '.gradle', '.proto', '.aidl', '.sh', '.yml',
   '.yaml', '.go', '.rs', '.s', '.asm', '.mf', '.pem', '.crt', '.cer', '.key'
+]);
+const REFERENCE_TEXT_EXTENSIONS = new Set([
+  '.bp', '.cfg', '.conf', '.gradle', '.ini', '.json', '.list', '.md', '.mk',
+  '.pem', '.prop', '.rc', '.txt', '.xml', '.yaml', '.yml'
 ]);
 const BINARY_EXTENSIONS = new Set(['.apk', '.apex', '.jar', '.so', '.bin', '.img', '.dat', '.o', '.a']);
 const ARCHIVE_PREVIEW_EXTENSIONS = new Set(['.apk', '.apks', '.apex', '.jar', '.srcjar']);
@@ -109,11 +118,13 @@ function loadConfig() {
   const fileConfig = fs.readJsonSync(CONFIG_PATH);
   const noteProjectKey = typeof fileConfig.noteProjectKey === 'string' ? fileConfig.noteProjectKey.trim() : DEFAULT_CONFIG.noteProjectKey;
   const noteProjectKeys = normalizeNoteProjectKeys(fileConfig.noteProjectKeys, noteProjectKey);
+  const referenceCompare = normalizeReferenceCompareConfig(fileConfig.referenceCompare);
   return {
     sourceDir: fileConfig.sourceDir || DEFAULT_CONFIG.sourceDir,
     projectDir: fileConfig.projectDir || DEFAULT_CONFIG.projectDir,
     noteProjectKey,
     noteProjectKeys,
+    referenceCompare,
     manualStatuses: fileConfig.manualStatuses || {},
   };
 }
@@ -133,6 +144,18 @@ function normalizeNoteProjectKeys(rawKeys = [], selectedKey = '') {
   }
 
   return Array.from(new Set(normalized));
+}
+
+function normalizeReferenceCompareConfig(rawConfig = {}) {
+  const raw = rawConfig && typeof rawConfig === 'object' ? rawConfig : {};
+  const rootDir = typeof raw.rootDir === 'string' ? raw.rootDir.trim() : '';
+  const month = typeof raw.month === 'string' ? raw.month.trim() : '';
+
+  return {
+    enabled: Boolean(raw.enabled),
+    rootDir,
+    month: /^\d{4}-\d{2}$/.test(month) ? month : '',
+  };
 }
 
 function getNextNoteTypeConfig(currentConfig, selectedKey) {
@@ -407,6 +430,468 @@ function getAllFiles(dirPath, arrayOfFiles = []) {
   });
 
   return arrayOfFiles;
+}
+
+function addMonths(month, delta) {
+  const [year, monthIndex] = month.split('-').map((item) => Number(item));
+  const date = new Date(Date.UTC(year, monthIndex - 1 + delta, 1));
+  return `${date.getUTCFullYear()}-${String(date.getUTCMonth() + 1).padStart(2, '0')}`;
+}
+
+function getMonthNameTokens(month) {
+  const monthNumber = Number(month.slice(5, 7));
+  const shortNames = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'];
+  const longNames = ['january', 'february', 'march', 'april', 'may', 'june', 'july', 'august', 'september', 'october', 'november', 'december'];
+  const shortName = shortNames[monthNumber - 1] || '';
+  const longName = longNames[monthNumber - 1] || '';
+  const year = month.slice(0, 4);
+  const compact = month.replace('-', '');
+
+  return [month, compact, `${year}_${shortName}`, `${year}-${shortName}`, shortName, longName]
+    .filter(Boolean)
+    .map((item) => item.toLowerCase());
+}
+
+function scorePathForMonth(dirPath, month) {
+  const name = path.basename(dirPath).toLowerCase();
+  return getMonthNameTokens(month).reduce((score, token) => (
+    name.includes(token) ? score + token.length : score
+  ), 0);
+}
+
+function listImmediateDirectories(dirPath) {
+  return fs.readdirSync(dirPath, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory() && !IGNORED_SCAN_DIR_NAMES.has(entry.name))
+    .map((entry) => path.join(dirPath, entry.name))
+    .sort((left, right) => path.basename(left).localeCompare(path.basename(right)));
+}
+
+function pickTwoReferenceDirectories(monthDir, label, warnings) {
+  const directories = listImmediateDirectories(monthDir);
+  if (directories.length < 2) {
+    warnings.push(`${label}: ${monthDir} 下未找到两个可对比目录`);
+    return null;
+  }
+
+  if (directories.length > 2) {
+    warnings.push(`${label}: ${monthDir} 下找到 ${directories.length} 个目录，默认使用排序前两个目录对比`);
+  }
+
+  return directories.slice(0, 2);
+}
+
+function pickOrderedNativeDirectories(monthDir, oldMonth, newMonth, warnings) {
+  const pair = pickTwoReferenceDirectories(monthDir, `${newMonth} 原生新增对比`, warnings);
+  if (!pair) {
+    return null;
+  }
+
+  const scored = pair.map((dirPath) => ({
+    dirPath,
+    oldScore: scorePathForMonth(dirPath, oldMonth),
+    newScore: scorePathForMonth(dirPath, newMonth),
+  }));
+  const oldCandidate = scored[0].oldScore >= scored[1].oldScore ? scored[0] : scored[1];
+  const newCandidate = scored[0].newScore >= scored[1].newScore ? scored[0] : scored[1];
+
+  if (oldCandidate.dirPath !== newCandidate.dirPath && oldCandidate.oldScore > 0 && newCandidate.newScore > 0) {
+    return { oldDir: oldCandidate.dirPath, newDir: newCandidate.dirPath };
+  }
+
+  warnings.push(`${newMonth} 原生新增对比: 未能从目录名稳定识别新旧顺序，默认按名称排序对比`);
+  return { oldDir: pair[0], newDir: pair[1] };
+}
+
+function isReferenceTextPath(filePath) {
+  return REFERENCE_TEXT_EXTENSIONS.has(path.extname(filePath).toLowerCase());
+}
+
+function getReferenceTextFiles(rootDir) {
+  return getAllFiles(rootDir)
+    .filter(isReferenceTextPath)
+    .map((fullPath) => path.relative(rootDir, fullPath).split(path.sep).join('/'));
+}
+
+function readReferenceTextFile(filePath) {
+  return fs.readFileSync(filePath, 'utf8');
+}
+
+function getAddedLines(oldContent = '', newContent = '') {
+  return getAddedLineBlocks(oldContent, newContent).flat();
+}
+
+const EXACT_LINE_DIFF_CELL_LIMIT = 2_000_000;
+
+function compactAddedLinesToBlock(lines) {
+  const block = lines.filter((line) => line.trim() !== '');
+  return block.length > 0 ? [block] : [];
+}
+
+function countNonBlankLines(lines) {
+  const counts = new Map();
+  lines.forEach((line) => {
+    if (!line.trim()) {
+      return;
+    }
+    counts.set(line, (counts.get(line) || 0) + 1);
+  });
+  return counts;
+}
+
+function filterBlocksByAddedLineBudget(blocks, oldLines, newLines) {
+  const oldCounts = countNonBlankLines(oldLines);
+  const newCounts = countNonBlankLines(newLines);
+  const addedBudget = new Map();
+
+  newCounts.forEach((newCount, line) => {
+    const addedCount = newCount - (oldCounts.get(line) || 0);
+    if (addedCount > 0) {
+      addedBudget.set(line, addedCount);
+    }
+  });
+
+  return blocks.map((block) => {
+    const filteredBlock = [];
+    block.forEach((line) => {
+      const budget = addedBudget.get(line) || 0;
+      if (budget <= 0) {
+        return;
+      }
+
+      filteredBlock.push(line);
+      addedBudget.set(line, budget - 1);
+    });
+    return filteredBlock;
+  }).filter((block) => block.length > 0);
+}
+
+function getExactAddedLineBlocks(oldLines, newLines) {
+  const oldCount = oldLines.length;
+  const newCount = newLines.length;
+  const dp = Array.from({ length: oldCount + 1 }, () => new Uint32Array(newCount + 1));
+
+  for (let oldIndex = oldCount - 1; oldIndex >= 0; oldIndex -= 1) {
+    const nextRow = dp[oldIndex + 1];
+    const currentRow = dp[oldIndex];
+    for (let newIndex = newCount - 1; newIndex >= 0; newIndex -= 1) {
+      if (oldLines[oldIndex] === newLines[newIndex]) {
+        currentRow[newIndex] = nextRow[newIndex + 1] + 1;
+      } else {
+        currentRow[newIndex] = Math.max(nextRow[newIndex], currentRow[newIndex + 1]);
+      }
+    }
+  }
+
+  const blocks = [];
+  let currentBlock = [];
+  let oldIndex = 0;
+  let newIndex = 0;
+
+  const flushBlock = () => {
+    const nonBlankBlock = currentBlock.filter((line) => line.trim() !== '');
+    if (nonBlankBlock.length > 0) {
+      blocks.push(nonBlankBlock);
+    }
+    currentBlock = [];
+  };
+
+  while (oldIndex < oldCount && newIndex < newCount) {
+    if (oldLines[oldIndex] === newLines[newIndex]) {
+      flushBlock();
+      oldIndex += 1;
+      newIndex += 1;
+    } else if (dp[oldIndex + 1][newIndex] >= dp[oldIndex][newIndex + 1]) {
+      oldIndex += 1;
+    } else {
+      currentBlock.push(newLines[newIndex]);
+      newIndex += 1;
+    }
+  }
+
+  while (newIndex < newCount) {
+    currentBlock.push(newLines[newIndex]);
+    newIndex += 1;
+  }
+
+  flushBlock();
+  return blocks;
+}
+
+function getUniqueCommonAnchors(oldLines, oldStart, oldEnd, newLines, newStart, newEnd) {
+  const oldCounts = new Map();
+  const oldPositions = new Map();
+  const newCounts = new Map();
+
+  for (let index = oldStart; index < oldEnd; index += 1) {
+    const line = oldLines[index];
+    oldCounts.set(line, (oldCounts.get(line) || 0) + 1);
+    oldPositions.set(line, index);
+  }
+
+  for (let index = newStart; index < newEnd; index += 1) {
+    const line = newLines[index];
+    newCounts.set(line, (newCounts.get(line) || 0) + 1);
+  }
+
+  const anchors = [];
+  for (let index = newStart; index < newEnd; index += 1) {
+    const line = newLines[index];
+    if (oldCounts.get(line) === 1 && newCounts.get(line) === 1) {
+      anchors.push({ oldIndex: oldPositions.get(line), newIndex: index });
+    }
+  }
+
+  return getIncreasingAnchors(anchors);
+}
+
+function getIncreasingAnchors(anchors) {
+  const tails = [];
+  const tailIndexes = [];
+  const previousIndexes = Array(anchors.length).fill(-1);
+
+  anchors.forEach((anchor, index) => {
+    let low = 0;
+    let high = tails.length;
+    while (low < high) {
+      const mid = Math.floor((low + high) / 2);
+      if (tails[mid] < anchor.oldIndex) {
+        low = mid + 1;
+      } else {
+        high = mid;
+      }
+    }
+
+    if (low > 0) {
+      previousIndexes[index] = tailIndexes[low - 1];
+    }
+    tails[low] = anchor.oldIndex;
+    tailIndexes[low] = index;
+  });
+
+  const orderedAnchors = [];
+  let cursor = tailIndexes[tails.length - 1];
+  while (cursor !== undefined && cursor >= 0) {
+    orderedAnchors.push(anchors[cursor]);
+    cursor = previousIndexes[cursor];
+  }
+
+  return orderedAnchors.reverse();
+}
+
+function getAnchoredAddedLineBlocks(oldLines, oldStart, oldEnd, newLines, newStart, newEnd) {
+  while (oldStart < oldEnd && newStart < newEnd && oldLines[oldStart] === newLines[newStart]) {
+    oldStart += 1;
+    newStart += 1;
+  }
+
+  while (oldStart < oldEnd && newStart < newEnd && oldLines[oldEnd - 1] === newLines[newEnd - 1]) {
+    oldEnd -= 1;
+    newEnd -= 1;
+  }
+
+  if (newStart >= newEnd) {
+    return [];
+  }
+
+  if (oldStart >= oldEnd) {
+    return compactAddedLinesToBlock(newLines.slice(newStart, newEnd));
+  }
+
+  const oldLength = oldEnd - oldStart;
+  const newLength = newEnd - newStart;
+  if (oldLength * newLength <= EXACT_LINE_DIFF_CELL_LIMIT) {
+    return getExactAddedLineBlocks(
+      oldLines.slice(oldStart, oldEnd),
+      newLines.slice(newStart, newEnd)
+    );
+  }
+
+  const anchors = getUniqueCommonAnchors(oldLines, oldStart, oldEnd, newLines, newStart, newEnd);
+  if (anchors.length === 0) {
+    return [];
+  }
+
+  const blocks = [];
+  let previousOld = oldStart;
+  let previousNew = newStart;
+
+  anchors.forEach((anchor) => {
+    blocks.push(...getAnchoredAddedLineBlocks(
+      oldLines,
+      previousOld,
+      anchor.oldIndex,
+      newLines,
+      previousNew,
+      anchor.newIndex
+    ));
+    previousOld = anchor.oldIndex + 1;
+    previousNew = anchor.newIndex + 1;
+  });
+
+  blocks.push(...getAnchoredAddedLineBlocks(oldLines, previousOld, oldEnd, newLines, previousNew, newEnd));
+  return blocks;
+}
+
+function getAddedLineBlocks(oldContent = '', newContent = '') {
+  const oldLines = splitContentLines(oldContent);
+  const newLines = splitContentLines(newContent);
+  const blocks = getAnchoredAddedLineBlocks(oldLines, 0, oldLines.length, newLines, 0, newLines.length);
+  return filterBlocksByAddedLineBudget(blocks, oldLines, newLines);
+}
+
+function splitContentLines(content = '') {
+  return content === '' ? [] : content.split(/\r?\n/);
+}
+
+function compareReferenceDirectories(leftDir, rightDir) {
+  const leftFiles = new Set(getReferenceTextFiles(leftDir));
+  const rightFiles = new Set(getReferenceTextFiles(rightDir));
+  const relativePaths = Array.from(new Set([...leftFiles, ...rightFiles])).sort();
+
+  return relativePaths.map((relativePath) => {
+    const leftPath = path.join(leftDir, relativePath);
+    const rightPath = path.join(rightDir, relativePath);
+    const leftExists = leftFiles.has(relativePath);
+    const rightExists = rightFiles.has(relativePath);
+
+    if (!leftExists || !rightExists) {
+      const contentPath = leftExists ? leftPath : rightPath;
+      const addedLines = splitContentLines(readReferenceTextFile(contentPath)).filter((line) => line.trim() !== '');
+      return {
+        relativePath,
+        changed: true,
+        addedLines,
+        addedLineBlocks: addedLines.length > 0 ? [addedLines] : [],
+        changeType: leftExists ? 'removed-or-custom-only' : 'added-or-custom-only',
+      };
+    }
+
+    const leftContent = readReferenceTextFile(leftPath);
+    const rightContent = readReferenceTextFile(rightPath);
+    if (leftContent === rightContent) {
+      return {
+        relativePath,
+        changed: false,
+        addedLines: [],
+        addedLineBlocks: [],
+        changeType: 'same',
+      };
+    }
+
+    const addedLineBlocks = getAddedLineBlocks(leftContent, rightContent);
+    return {
+      relativePath,
+      changed: true,
+      addedLines: addedLineBlocks.flat(),
+      addedLineBlocks,
+      changeType: 'changed',
+    };
+  }).filter((item) => item.changed);
+}
+
+function addReferenceHit(index, relativePath, hit) {
+  if (!index.has(relativePath)) {
+    index.set(relativePath, {
+      customDiffs: [],
+      nativeAdditions: [],
+      addedLines: new Set(),
+    });
+  }
+
+  const entry = index.get(relativePath);
+  if (hit.type === 'custom') {
+    entry.customDiffs.push(hit);
+  } else if (hit.type === 'native-addition') {
+    entry.nativeAdditions.push(hit);
+  }
+
+  (hit.addedLines || []).forEach((line) => {
+    if (line.trim()) {
+      entry.addedLines.add(line);
+    }
+  });
+}
+
+function buildReferenceCompareIndex(config) {
+  const referenceConfig = normalizeReferenceCompareConfig(config.referenceCompare);
+  const report = {
+    enabled: referenceConfig.enabled,
+    rootDir: referenceConfig.rootDir,
+    month: referenceConfig.month,
+    warnings: [],
+    customDiffCount: 0,
+    nativeAdditionCount: 0,
+  };
+  const index = new Map();
+
+  if (!referenceConfig.enabled) {
+    return { index, report };
+  }
+
+  if (!referenceConfig.rootDir || !referenceConfig.month) {
+    report.warnings.push('已开启客制化参考对比，但参考根目录或月份未填写');
+    return { index, report };
+  }
+
+  if (!fs.existsSync(referenceConfig.rootDir)) {
+    report.warnings.push(`参考根目录不存在: ${referenceConfig.rootDir}`);
+    return { index, report };
+  }
+
+  const previousMonth = addMonths(referenceConfig.month, -1);
+  const twoMonthsAgo = addMonths(referenceConfig.month, -2);
+
+  [previousMonth, twoMonthsAgo].forEach((month) => {
+    const monthDir = path.join(referenceConfig.rootDir, month);
+    if (!fs.existsSync(monthDir)) {
+      report.warnings.push(`未找到上两月客制化参考目录: ${monthDir}`);
+      return;
+    }
+
+    const pair = pickTwoReferenceDirectories(monthDir, `${month} 客制化差异对比`, report.warnings);
+    if (!pair) {
+      return;
+    }
+
+    compareReferenceDirectories(pair[0], pair[1]).forEach((diff) => {
+      addReferenceHit(index, diff.relativePath, {
+        type: 'custom',
+        month,
+        pair: pair.map((item) => path.basename(item)),
+        changeType: diff.changeType,
+        addedLines: diff.addedLines,
+        addedLineBlocks: diff.addedLineBlocks,
+      });
+      report.customDiffCount += 1;
+    });
+  });
+
+  const currentMonthDir = path.join(referenceConfig.rootDir, referenceConfig.month);
+  if (!fs.existsSync(currentMonthDir)) {
+    report.warnings.push(`未找到当前月份原生新增参考目录: ${currentMonthDir}`);
+    return { index, report };
+  }
+
+  const orderedPair = pickOrderedNativeDirectories(currentMonthDir, previousMonth, referenceConfig.month, report.warnings);
+  if (orderedPair) {
+    compareReferenceDirectories(orderedPair.oldDir, orderedPair.newDir).forEach((diff) => {
+      if (diff.addedLines.length === 0 && diff.changeType === 'changed') {
+        return;
+      }
+
+      addReferenceHit(index, diff.relativePath, {
+        type: 'native-addition',
+        month: referenceConfig.month,
+        pair: [path.basename(orderedPair.oldDir), path.basename(orderedPair.newDir)],
+        changeType: diff.changeType,
+        addedLines: diff.addedLines,
+        addedLineBlocks: diff.addedLineBlocks,
+      });
+      report.nativeAdditionCount += 1;
+    });
+  }
+
+  return { index, report };
 }
 
 function readFileHead(filePath, maxBytes = 2048) {
@@ -856,10 +1341,65 @@ function applyManualStatus(relativePath, summary, manualStatuses) {
   };
 }
 
-function buildFileSummary(relativePath, fullPath, targetPath, manualStatuses) {
+function formatReferenceReason(referenceInfo) {
+  if (!referenceInfo) {
+    return '';
+  }
+
+  const parts = [];
+  if (referenceInfo.customDiffs.length > 0) {
+    const months = Array.from(new Set(referenceInfo.customDiffs.map((item) => item.month))).join(', ');
+    parts.push(`上两月客制化差异: ${months}`);
+  }
+
+  if (referenceInfo.nativeAdditions.length > 0) {
+    parts.push(`上月原生新增参考: ${referenceInfo.nativeAdditions.length} 处`);
+  }
+
+  return parts.join('；');
+}
+
+function serializeReferenceInfo(referenceEntry) {
+  if (!referenceEntry) {
+    return null;
+  }
+
+  return {
+    customDiffs: referenceEntry.customDiffs,
+    nativeAdditions: referenceEntry.nativeAdditions,
+    addedLines: Array.from(referenceEntry.addedLines),
+    highlightSourceAdditions: referenceEntry.nativeAdditions.length > 0,
+  };
+}
+
+function applyReferenceInfo(summary, referenceInfo) {
+  if (!referenceInfo) {
+    return summary;
+  }
+
+  const referenceReason = formatReferenceReason(referenceInfo);
+  const nextSummary = {
+    ...summary,
+    referenceInfo,
+    reason: referenceReason ? `${summary.reason}。参考对比: ${referenceReason}` : summary.reason,
+  };
+
+  if (summary.status !== 'danger' && summary.status !== 'same' && referenceInfo.customDiffs.length > 0) {
+    return {
+      ...nextSummary,
+      status: 'warning',
+      reason: `严禁自动覆盖：检测到上两月有客制化痕迹。参考对比: ${referenceReason}`,
+    };
+  }
+
+  return nextSummary;
+}
+
+function buildFileSummary(relativePath, fullPath, targetPath, manualStatuses, referenceIndex = new Map()) {
   const ext = path.extname(fullPath).toLowerCase();
   const targetExists = fs.existsSync(targetPath);
   const textFile = isTextFile(fullPath, ext);
+  const referenceInfo = serializeReferenceInfo(referenceIndex.get(relativePath));
 
   let summary = {
     ext,
@@ -869,6 +1409,7 @@ function buildFileSummary(relativePath, fullPath, targetPath, manualStatuses) {
     targetExists,
     sourceContent: '',
     targetContent: '',
+    referenceInfo,
   };
 
   if (textFile && !isSourceArchive(ext)) {
@@ -908,7 +1449,7 @@ function buildFileSummary(relativePath, fullPath, targetPath, manualStatuses) {
     summary.reason = targetExists ? '二进制文件存在差异，可查看完整转储内容' : '目标文件不存在，将新增二进制文件';
   }
 
-  return applyManualStatus(relativePath, summary, manualStatuses);
+  return applyManualStatus(relativePath, applyReferenceInfo(summary, referenceInfo), manualStatuses);
 }
 
 function getConfigOrThrow() {
@@ -925,6 +1466,22 @@ function getConfigOrThrow() {
   return config;
 }
 
+function getRealDirectoryPath(dirPath) {
+  return fs.realpathSync(path.resolve(dirPath));
+}
+
+function assertSafeScanConfig(config) {
+  const sourceRealPath = getRealDirectoryPath(config.sourceDir);
+  const projectRealPath = getRealDirectoryPath(config.projectDir);
+
+  if (sourceRealPath === projectRealPath) {
+    throw Object.assign(
+      new Error('资源包路径和项目路径不能指向同一个目录，请选择一个独立的待合入资源包目录。'),
+      { statusCode: 400 }
+    );
+  }
+}
+
 app.get('/api/config', async (req, res) => {
   try {
     const config = loadConfig();
@@ -933,6 +1490,7 @@ app.get('/api/config', async (req, res) => {
       projectDir: config.projectDir,
       noteProjectKey: config.noteProjectKey,
       noteProjectKeys: config.noteProjectKeys,
+      referenceCompare: config.referenceCompare,
       manualStatuses: config.manualStatuses,
     });
   } catch (err) {
@@ -945,6 +1503,7 @@ app.post('/api/config', async (req, res) => {
     const sourceDir = (req.body.sourceDir || '').trim();
     const projectDir = (req.body.projectDir || '').trim();
     const noteProjectKey = typeof req.body.noteProjectKey === 'string' ? req.body.noteProjectKey.trim() : '';
+    const referenceCompare = normalizeReferenceCompareConfig(req.body.referenceCompare);
     const currentConfig = loadConfig();
     const noteProjectKeys = normalizeNoteProjectKeys(req.body.noteProjectKeys, noteProjectKey);
 
@@ -960,11 +1519,18 @@ app.post('/api/config', async (req, res) => {
       return res.status(400).json({ error: `项目路径不存在: ${projectDir}` });
     }
 
+    try {
+      assertSafeScanConfig({ sourceDir, projectDir });
+    } catch (err) {
+      return res.status(err.statusCode || 400).json({ error: err.message });
+    }
+
     const nextConfig = {
       sourceDir,
       projectDir,
       noteProjectKey: noteProjectKey && noteProjectKeys.includes(noteProjectKey) ? noteProjectKey : (noteProjectKeys[0] || ''),
       noteProjectKeys,
+      referenceCompare,
       manualStatuses: currentConfig.manualStatuses || {},
     };
     saveConfig(nextConfig);
@@ -1170,6 +1736,7 @@ app.post('/api/status-override/reset', async (req, res) => {
 app.get('/api/scan', async (req, res) => {
   try {
     let config = getConfigOrThrow();
+    assertSafeScanConfig(config);
     const resetManualStatuses = req.query.reset_manual === '1';
 
     if (resetManualStatuses && Object.keys(config.manualStatuses || {}).length > 0) {
@@ -1177,6 +1744,7 @@ app.get('/api/scan', async (req, res) => {
       saveConfig(config);
     }
 
+    const referenceCompare = buildReferenceCompareIndex(config);
     const sourceFiles = getAllFiles(config.sourceDir);
     const nextManualStatuses = { ...(config.manualStatuses || {}) };
     let manualStatusesChanged = false;
@@ -1184,7 +1752,7 @@ app.get('/api/scan', async (req, res) => {
     const results = sourceFiles.map((fullPath) => {
       const relativePath = path.relative(config.sourceDir, fullPath);
       const targetPath = path.join(config.projectDir, relativePath);
-      const summary = buildFileSummary(relativePath, fullPath, targetPath, config.manualStatuses);
+      const summary = buildFileSummary(relativePath, fullPath, targetPath, config.manualStatuses, referenceCompare.index);
 
        if (summary.status === 'same' && nextManualStatuses[relativePath]) {
         delete nextManualStatuses[relativePath];
@@ -1197,6 +1765,7 @@ app.get('/api/scan', async (req, res) => {
         status: summary.status,
         reason: summary.reason,
         manualStatus: summary.manualStatus,
+        referenceInfo: summary.referenceInfo,
         sourceContent: summary.sourceContent.slice(0, PREVIEW_LIMIT),
         targetContent: summary.targetContent.slice(0, PREVIEW_LIMIT),
         targetExists: summary.targetExists,
@@ -1208,9 +1777,22 @@ app.get('/api/scan', async (req, res) => {
       saveConfig({ ...config, manualStatuses: nextManualStatuses });
     }
 
-    res.json(results);
+    referenceCompare.report.customDiffMatchedCount = results.filter((item) => (
+      (item.referenceInfo?.customDiffs || []).length > 0
+    )).length;
+    referenceCompare.report.nativeAdditionMatchedCount = results.filter((item) => (
+      (item.referenceInfo?.nativeAdditions || []).length > 0
+    )).length;
+    referenceCompare.report.customDiffWarningCount = results.filter((item) => (
+      item.status === 'warning' && (item.referenceInfo?.customDiffs || []).length > 0
+    )).length;
+
+    res.json({
+      items: results,
+      referenceCompare: referenceCompare.report,
+    });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    res.status(err.statusCode || 500).json({ error: err.message });
   }
 });
 
@@ -1307,7 +1889,8 @@ app.post('/api/file-content/save', async (req, res) => {
 
     await fs.ensureDir(path.dirname(targetPath));
     await fs.writeFile(targetPath, targetContent, 'utf8');
-    const summary = buildFileSummary(relativePath, sourcePath, targetPath, config.manualStatuses);
+    const referenceCompare = buildReferenceCompareIndex(config);
+    const summary = buildFileSummary(relativePath, sourcePath, targetPath, config.manualStatuses, referenceCompare.index);
     res.json({
       ok: true,
       item: {
@@ -1316,6 +1899,7 @@ app.post('/api/file-content/save', async (req, res) => {
         status: summary.status,
         reason: summary.reason,
         manualStatus: summary.manualStatus,
+        referenceInfo: summary.referenceInfo,
         sourceContent: summary.sourceContent.slice(0, PREVIEW_LIMIT),
         targetContent: summary.targetContent.slice(0, PREVIEW_LIMIT),
         targetExists: summary.targetExists,
@@ -1403,6 +1987,12 @@ app.post('/api/merge', async (req, res) => {
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`Mainline 后端服务运行在 http://localhost:${PORT}`);
-});
+if (process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1])) {
+  app.listen(PORT, () => {
+    console.log(`Mainline 后端服务运行在 http://localhost:${PORT}`);
+  });
+}
+
+export {
+  getAddedLineBlocks,
+};

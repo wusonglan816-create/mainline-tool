@@ -70,6 +70,14 @@ function normalizeScanResultItem(item, indexFallback = 0) {
   };
 }
 
+function normalizeReferenceCompareConfig(config = {}) {
+  return {
+    enabled: Boolean(config.enabled),
+    rootDir: typeof config.rootDir === 'string' ? config.rootDir : '',
+    month: typeof config.month === 'string' ? config.month : '',
+  };
+}
+
 function summarizeScanResults(items = []) {
   return items.reduce((summary, item) => {
     if (item.status === 'same') {
@@ -80,6 +88,8 @@ function summarizeScanResults(items = []) {
     summary.visibleCount += 1;
     if (item.status === 'danger') {
       summary.dangerCount += 1;
+    } else if (item.status === 'warning') {
+      summary.warningCount += 1;
     } else if (item.status === 'update') {
       summary.updateCount += 1;
     }
@@ -89,8 +99,101 @@ function summarizeScanResults(items = []) {
     visibleCount: 0,
     sameCount: 0,
     dangerCount: 0,
+    warningCount: 0,
     updateCount: 0,
   });
+}
+
+function isManualReviewStatus(status) {
+  return status === 'danger' || status === 'warning';
+}
+
+function getStatusBadgeLabel(status) {
+  if (status === 'danger') return 'Danger';
+  if (status === 'warning') return 'Warning';
+  if (status === 'same' || status === 'safe') return 'Skip';
+  return 'Ready';
+}
+
+function getStatusBadgeClass(status) {
+  if (status === 'danger') return 'bg-red-500/20 text-red-400';
+  if (status === 'warning') return 'bg-amber-500/20 text-amber-300';
+  if (status === 'same' || status === 'safe') return 'bg-slate-500/15 text-slate-400';
+  return 'bg-green-500/20 text-green-400';
+}
+
+function normalizeReferenceLine(line = '') {
+  return line.endsWith('\r') ? line.slice(0, -1) : line;
+}
+
+function getNativeAdditionLineBlocks(referenceInfo) {
+  return (referenceInfo?.nativeAdditions || []).flatMap((item) => {
+    const blocks = Array.isArray(item.addedLineBlocks) && item.addedLineBlocks.length > 0
+      ? item.addedLineBlocks
+      : [];
+    return blocks.map((block) => (
+      block
+        .map((line) => normalizeReferenceLine(line))
+        .filter((line) => line.trim())
+    )).filter((block) => block.length > 0);
+  });
+}
+
+function tryMatchNativeAdditionBlock(rows, startIndex, block) {
+  const matchedIndexes = [];
+  let blockIndex = 0;
+  let rowIndex = startIndex;
+
+  while (rowIndex < rows.length && blockIndex < block.length) {
+    const row = rows[rowIndex];
+    const canHighlightRow = row.type === 'added' || row.type === 'changed';
+    const rightText = normalizeReferenceLine(row.rightText || '');
+
+    if (!canHighlightRow) {
+      return null;
+    }
+
+    if (!rightText.trim()) {
+      rowIndex += 1;
+      continue;
+    }
+
+    if (rightText !== block[blockIndex]) {
+      return null;
+    }
+
+    matchedIndexes.push(rowIndex);
+    blockIndex += 1;
+    rowIndex += 1;
+  }
+
+  return blockIndex === block.length ? matchedIndexes : null;
+}
+
+function buildNativeAdditionHighlightRows(rows = [], referenceInfo = null) {
+  const blocks = getNativeAdditionLineBlocks(referenceInfo);
+  const highlightedRows = new Set();
+
+  if (blocks.length === 0) {
+    return highlightedRows;
+  }
+
+  let searchStart = 0;
+
+  blocks.forEach((block) => {
+    for (let index = searchStart; index < rows.length; index += 1) {
+      const matchedIndexes = tryMatchNativeAdditionBlock(rows, index, block);
+      if (!matchedIndexes) {
+        continue;
+      }
+
+      matchedIndexes.forEach((matchedIndex) => highlightedRows.add(matchedIndex));
+      searchStart = matchedIndexes[matchedIndexes.length - 1] + 1;
+      break;
+    }
+  });
+
+  return highlightedRows;
 }
 
 function isBlankLine(line = '') {
@@ -528,6 +631,7 @@ function DiffCell({
   rowType,
   otherText,
   emptyLabel,
+  highlightTone = 'default',
   editable = false,
   onTextChange,
   onEditorKeyDown,
@@ -545,7 +649,14 @@ function DiffCell({
     }
 
     if (rowType === 'added' || rowType === 'removed') {
+      if (highlightTone === 'warning' && rowType === 'added') {
+        return 'text-amber-100 bg-amber-500/20 rounded-sm';
+      }
       return 'text-red-200 bg-red-500/15 rounded-sm';
+    }
+
+    if (highlightTone === 'warning') {
+      return 'text-amber-100 bg-amber-500/20 rounded-sm';
     }
 
     return 'text-red-300 bg-red-500/15 rounded-sm';
@@ -603,6 +714,7 @@ function ComparePane({
   badge,
   rows,
   side,
+  highlightRowIndexes = new Set(),
   paneRef,
   onScroll,
   editing = false,
@@ -642,6 +754,7 @@ function ComparePane({
                 rowType={row.type === 'removed' ? 'placeholder' : row.type}
                 otherText={row.leftText}
                 emptyLabel={row.type === 'gap' ? '...' : ''}
+                highlightTone={highlightRowIndexes.has(actualIndex) ? 'warning' : 'default'}
               />
             )}
           </div>
@@ -728,13 +841,20 @@ function CompareWorkspace({
   expanded = false,
   onToggleExpand,
 }) {
+  const nativeAdditionHighlightRows = useMemo(
+    () => buildNativeAdditionHighlightRows(selectedDiffRows, selectedDisplay?.referenceInfo),
+    [selectedDiffRows, selectedDisplay?.referenceInfo]
+  );
+  const highlightSourceAdditions = nativeAdditionHighlightRows.size > 0;
+
   return (
     <div className="relative h-full min-h-0 flex-1 flex gap-0 overflow-hidden border border-slate-800 rounded-lg shadow-2xl">
       <ComparePane
         title="待合入资源包"
-        badge={<span className="text-blue-400 text-[11px]">GMS资源 Package</span>}
+        badge={highlightSourceAdditions ? <span className="text-amber-300 text-[11px]">参考新增高亮</span> : <span className="text-blue-400 text-[11px]">GMS资源 Package</span>}
         rows={selectedDiffRows}
         side="right"
+        highlightRowIndexes={nativeAdditionHighlightRows}
         paneRef={rightPaneRef}
         onScroll={onRightScroll}
         virtualRange={virtualRange}
@@ -746,7 +866,7 @@ function CompareWorkspace({
       />
       <ComparePane
         title="当前本地项目"
-        badge={selectedDisplay.status === 'danger' ? <span className="bg-red-500/20 text-red-500 px-2 py-0.5 rounded text-[10px] border border-red-500/30">检测到冲突</span> : null}
+        badge={selectedDisplay.status === 'danger' ? <span className="bg-red-500/20 text-red-500 px-2 py-0.5 rounded text-[10px] border border-red-500/30">检测到冲突</span> : selectedDisplay.status === 'warning' ? <span className="bg-amber-500/20 text-amber-300 px-2 py-0.5 rounded text-[10px] border border-amber-500/30">客制化参考</span> : null}
         rows={selectedDiffRows}
         side="left"
         paneRef={leftPaneRef}
@@ -1156,10 +1276,17 @@ function AppHeader({
 function PathConfigSection({
   sourceDirInput,
   projectDirInput,
+  referenceCompareEnabled,
+  referenceCompareRootInput,
+  referenceCompareMonthInput,
+  referenceCompareReport,
   activeConfig,
   configSaving,
   onSourceChange,
   onProjectChange,
+  onReferenceCompareEnabledChange,
+  onReferenceCompareRootChange,
+  onReferenceCompareMonthChange,
   onSave,
 }) {
   return (
@@ -1177,7 +1304,65 @@ function PathConfigSection({
           {configSaving ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshCw size={16} />} 保存扫描
         </button>
       </div>
+      <div className="mt-3 rounded-xl border border-slate-800 bg-slate-900/35 px-4 py-3">
+        <label className="flex items-center gap-2 text-xs font-semibold text-amber-200">
+          <input
+            type="checkbox"
+            checked={referenceCompareEnabled}
+            onChange={onReferenceCompareEnabledChange}
+            className="h-4 w-4 rounded border-slate-600 bg-slate-950 accent-amber-500"
+          />
+          开启客制化参考对比
+          <span className="text-[11px] font-normal text-slate-500">按月份目录识别上两月客制化差异和上月原生新增内容</span>
+        </label>
+        {referenceCompareEnabled && (
+          <div className="mt-3 grid grid-cols-[1fr_180px] gap-3">
+            <label className="flex flex-col gap-1">
+              <span className="text-[11px] uppercase tracking-widest text-slate-500">参考根目录</span>
+              <input
+                value={referenceCompareRootInput}
+                onChange={onReferenceCompareRootChange}
+                className="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2.5 text-sm text-slate-200 outline-none transition focus:border-amber-400/50"
+                placeholder="/media/wsl/jixie/资源/"
+              />
+            </label>
+            <label className="flex flex-col gap-1">
+              <span className="text-[11px] uppercase tracking-widest text-slate-500">当前月份</span>
+              <input
+                type="text"
+                inputMode="numeric"
+                pattern="\d{4}-\d{2}"
+                value={referenceCompareMonthInput}
+                onChange={onReferenceCompareMonthChange}
+                className="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2.5 text-sm text-slate-200 outline-none transition focus:border-amber-400/50"
+                placeholder="2026-05"
+              />
+            </label>
+          </div>
+        )}
+        {referenceCompareReport?.enabled && (
+          <div className="mt-3 flex flex-wrap items-center gap-2 text-[11px] text-slate-400">
+            <span className="rounded border border-amber-500/20 bg-amber-500/10 px-2 py-1 text-amber-200">
+              参考客制差异 {referenceCompareReport.customDiffCount || 0} 条
+            </span>
+            <span className="rounded border border-amber-500/20 bg-amber-500/10 px-2 py-1 text-amber-200">
+              当前命中客制 {referenceCompareReport.customDiffMatchedCount || 0} 文件 / 黄色人工 {referenceCompareReport.customDiffWarningCount || 0}
+            </span>
+            <span className="rounded border border-blue-500/20 bg-blue-500/10 px-2 py-1 text-blue-200">
+              参考原生新增 {referenceCompareReport.nativeAdditionCount || 0} 条
+            </span>
+            <span className="rounded border border-blue-500/20 bg-blue-500/10 px-2 py-1 text-blue-200">
+              当前命中原生新增 {referenceCompareReport.nativeAdditionMatchedCount || 0} 文件
+            </span>
+            {(referenceCompareReport.warnings || []).map((warning) => (
+              <span key={warning} className="rounded border border-red-500/20 bg-red-500/10 px-2 py-1 text-red-200">
+                {warning}
+              </span>
+            ))}
+          </div>
+        )}
       <p className="mt-2 text-xs text-slate-500 font-mono">当前生效: Remark Type = {activeConfig.noteProjectKey || '-'} | Source = {activeConfig.sourceDir || '-'} | Project = {activeConfig.projectDir || '-'}</p>
+      </div>
     </section>
   );
 }
@@ -1185,7 +1370,9 @@ function PathConfigSection({
 function FileSidebar({
   filter,
   visibleCount,
+  manualReviewCount,
   dangerCount,
+  warningCount,
   updateCount,
   searchTerm,
   onFilterChange,
@@ -1202,10 +1389,11 @@ function FileSidebar({
   return (
     <div className="w-80 border-r border-slate-800 flex flex-col bg-slate-900/30 shrink-0">
       <div className="p-4 bg-slate-900/50">
-        <div className="flex bg-slate-800 p-1 rounded-lg border border-slate-700 mb-3">
-          <button onClick={() => onFilterChange('all')} className={`px-4 py-1.5 text-xs rounded-md transition-all ${filter === 'all' ? 'bg-slate-600 text-white shadow-sm' : 'text-slate-400 hover:text-white'}`}>全部 ({visibleCount})</button>
-          <button onClick={() => onFilterChange('danger')} className={`px-4 py-1.5 text-xs rounded-md transition-all ${filter === 'danger' ? 'bg-red-600 text-white shadow-sm' : 'text-slate-400 hover:text-white'}`}>人工接入 ({dangerCount})</button>
-          <button onClick={() => onFilterChange('update')} className={`px-4 py-1.5 text-xs rounded-md transition-all ${filter === 'update' ? 'bg-green-600 text-white shadow-sm' : 'text-slate-400 hover:text-white'}`}>可合入 ({updateCount})</button>
+        <div className="grid grid-cols-4 gap-1 bg-slate-800 p-1 rounded-lg border border-slate-700 mb-3">
+          <button onClick={() => onFilterChange('all')} className={`min-w-0 px-1.5 py-1.5 text-[11px] rounded-md transition-all ${filter === 'all' ? 'bg-slate-600 text-white shadow-sm' : 'text-slate-400 hover:text-white'}`}><span className="block leading-4">全部</span><span className="block font-mono text-[10px] opacity-80">{visibleCount}</span></button>
+          <button onClick={() => onFilterChange('danger')} className={`min-w-0 px-1.5 py-1.5 text-[11px] rounded-md transition-all ${filter === 'danger' ? 'bg-red-600 text-white shadow-sm' : 'text-slate-400 hover:text-white'}`}><span className="block leading-4">人工</span><span className="block font-mono text-[10px] opacity-80">{manualReviewCount}</span></button>
+          <button onClick={() => onFilterChange('warning')} className={`min-w-0 px-1.5 py-1.5 text-[11px] rounded-md transition-all ${filter === 'warning' ? 'bg-amber-600 text-white shadow-sm' : 'text-slate-400 hover:text-white'}`}><span className="block leading-4">客制</span><span className="block font-mono text-[10px] opacity-80">{warningCount}</span></button>
+          <button onClick={() => onFilterChange('update')} className={`min-w-0 px-1.5 py-1.5 text-[11px] rounded-md transition-all ${filter === 'update' ? 'bg-green-600 text-white shadow-sm' : 'text-slate-400 hover:text-white'}`}><span className="block leading-4">可合入</span><span className="block font-mono text-[10px] opacity-80">{updateCount}</span></button>
         </div>
         <div className="relative">
           <Search className="absolute left-3 top-2.5 text-slate-500" size={14} />
@@ -1254,8 +1442,8 @@ function FileSidebar({
                     <p className={`text-[13px] font-medium truncate ${selectedFile?.id === file.id ? 'text-blue-400' : 'text-slate-300'}`}>{file.path.split('/').pop()}</p>
                     <p className="text-[10px] text-slate-500 truncate mt-0.5">{file.path}</p>
                     <div className="flex items-center gap-2 mt-2">
-                      <span className={`text-[9px] px-1.5 py-0.5 rounded-sm font-bold uppercase tracking-wider ${file.status === 'danger' ? 'bg-red-500/20 text-red-400' : file.status === 'safe' ? 'bg-amber-500/20 text-amber-300' : 'bg-green-500/20 text-green-400'}`}>
-                        {file.status === 'danger' ? 'Danger' : file.status === 'safe' ? 'Skip' : 'Ready'}
+                      <span className={`text-[9px] px-1.5 py-0.5 rounded-sm font-bold uppercase tracking-wider ${getStatusBadgeClass(file.status)}`}>
+                        {getStatusBadgeLabel(file.status)}
                       </span>
                       <span className="text-[10px] text-slate-600 font-mono">{file.size}</span>
                     </div>
@@ -1270,13 +1458,14 @@ function FileSidebar({
   );
 }
 
-function AppFooter({ visibleCount, sameCount, dangerCount, updateCount }) {
+function AppFooter({ visibleCount, sameCount, dangerCount, warningCount, updateCount }) {
   return (
     <footer className="px-6 py-2.5 bg-slate-900 border-t border-slate-800 flex justify-between items-center text-[11px] text-slate-500 font-mono shrink-0">
       <div className="flex items-center gap-6">
         <span className="flex items-center gap-1.5"><div className="w-2 h-2 rounded-full bg-blue-500"></div> 扫描总数: {visibleCount}</span>
         <span className="flex items-center gap-1.5 text-slate-400"><div className="w-2 h-2 rounded-full bg-slate-500"></div> 相同文件: {sameCount}</span>
         <span className="flex items-center gap-1.5 text-red-400/80"><div className="w-2 h-2 rounded-full bg-red-500 animate-pulse"></div> 风险拦截: {dangerCount}</span>
+        <span className="flex items-center gap-1.5 text-amber-300/90"><div className="w-2 h-2 rounded-full bg-amber-400"></div> 客制参考: {warningCount}</span>
         <span className="flex items-center gap-1.5 text-green-400/80"><div className="w-2 h-2 rounded-full bg-green-500"></div> 安全可合入: {updateCount}</span>
       </div>
       <div className="flex items-center gap-4"><span className="bg-slate-800 px-2 py-0.5 rounded border border-slate-700">Session OK</span><span>{new Date().toLocaleTimeString()}</span></div>
@@ -1359,7 +1548,7 @@ function DetailActionButtons({
 }) {
   return (
     <div className="flex gap-2 items-center flex-wrap justify-end">
-      {selectedDisplay.status === 'danger' ? (
+      {isManualReviewStatus(selectedDisplay.status) ? (
         <button disabled={savingStatus || savingContent} onClick={() => onToggleStatus('update')} className="px-3 py-1.5 text-xs bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white rounded-lg">切回 Ready</button>
       ) : (
         <button disabled={savingStatus || savingContent} onClick={() => onToggleStatus('danger')} className="px-3 py-1.5 text-xs bg-red-600 hover:bg-red-500 disabled:opacity-50 text-white rounded-lg">标记为 Danger</button>
@@ -1573,9 +1762,13 @@ export default function App() {
   const [searchTerm, setSearchTerm] = useState('');
   const [fullContentMap, setFullContentMap] = useState({});
   const [expandedGroups, setExpandedGroups] = useState({});
-  const [activeConfig, setActiveConfig] = useState({ sourceDir: '', projectDir: '', noteProjectKey: '', noteProjectKeys: [] });
+  const [activeConfig, setActiveConfig] = useState({ sourceDir: '', projectDir: '', noteProjectKey: '', noteProjectKeys: [], referenceCompare: normalizeReferenceCompareConfig() });
   const [sourceDirInput, setSourceDirInput] = useState('');
   const [projectDirInput, setProjectDirInput] = useState('');
+  const [referenceCompareEnabled, setReferenceCompareEnabled] = useState(false);
+  const [referenceCompareRootInput, setReferenceCompareRootInput] = useState('');
+  const [referenceCompareMonthInput, setReferenceCompareMonthInput] = useState('');
+  const [referenceCompareReport, setReferenceCompareReport] = useState(null);
   const [noteProjectKeyInput, setNoteProjectKeyInput] = useState('');
   const [noteTypeOptions, setNoteTypeOptions] = useState([]);
   const [editingTarget, setEditingTarget] = useState(false);
@@ -1677,12 +1870,16 @@ export default function App() {
     const res = await fetch('/api/config');
     const data = await readJsonResponse(res, '读取路径配置接口返回了非 JSON 响应，请检查后端服务');
     if (!res.ok) throw new Error(data.error || '读取路径配置失败');
-    setActiveConfig(data);
+    const referenceCompare = normalizeReferenceCompareConfig(data.referenceCompare);
+    setActiveConfig({ ...data, referenceCompare });
     setSourceDirInput(data.sourceDir || '');
     setProjectDirInput(data.projectDir || '');
+    setReferenceCompareEnabled(referenceCompare.enabled);
+    setReferenceCompareRootInput(referenceCompare.rootDir);
+    setReferenceCompareMonthInput(referenceCompare.month);
     setNoteProjectKeyInput(data.noteProjectKey || '');
     setNoteTypeOptions(data.noteProjectKeys || []);
-    return data;
+    return { ...data, referenceCompare };
   };
 
   const fetchHeaderNote = async (config) => {
@@ -1718,7 +1915,9 @@ export default function App() {
     const res = await fetch(`/api/scan${query}`);
     const data = await readJsonResponse(res, '扫描接口返回了非 JSON 响应，请检查后端服务');
     if (!res.ok) throw new Error(data.error || '扫描失败');
-    const normalized = data.map((item, index) => normalizeScanResultItem(item, index + 1));
+    const items = Array.isArray(data) ? data : (data.items || []);
+    setReferenceCompareReport(Array.isArray(data) ? null : data.referenceCompare || null);
+    const normalized = items.map((item, index) => normalizeScanResultItem(item, index + 1));
     applyScanResults(normalized, preferredPath);
   };
 
@@ -1775,7 +1974,10 @@ export default function App() {
   const filteredResults = useMemo(() => {
     return scanResults.filter((item) => {
       if (item.status === 'same') return false;
-      return (filter === 'all' || item.status === filter) && item.path.toLowerCase().includes(searchTerm.toLowerCase());
+      const matchesFilter = filter === 'all'
+        || item.status === filter
+        || (filter === 'danger' && isManualReviewStatus(item.status));
+      return matchesFilter && item.path.toLowerCase().includes(searchTerm.toLowerCase());
     });
   }, [filter, scanResults, searchTerm]);
 
@@ -1803,8 +2005,10 @@ export default function App() {
     visibleCount,
     sameCount,
     dangerCount,
+    warningCount,
     updateCount,
   } = useMemo(() => summarizeScanResults(scanResults), [scanResults]);
+  const manualReviewCount = dangerCount + warningCount;
 
   const selectedDisplay = useMemo(() => {
     if (!selectedFile) return null;
@@ -1840,7 +2044,7 @@ export default function App() {
   }, [selectedDisplay?.path]);
 
   const canCompareAsText = Boolean(selectedDisplay && (selectedDisplay.type === 'text' || selectedDisplay.contentType === 'binary-dump'));
-  const canEditTarget = Boolean(selectedDisplay && selectedDisplay.status === 'danger' && selectedDisplay.editable);
+  const canEditTarget = Boolean(selectedDisplay && isManualReviewStatus(selectedDisplay.status) && selectedDisplay.editable);
 
   const selectedDiffState = useMemo(() => {
     if (!canCompareAsText || !selectedDisplay) {
@@ -1959,13 +2163,22 @@ export default function App() {
         body: JSON.stringify({
           sourceDir: sourceDirInput,
           projectDir: projectDirInput,
+          referenceCompare: {
+            enabled: referenceCompareEnabled,
+            rootDir: referenceCompareRootInput,
+            month: referenceCompareMonthInput,
+          },
           noteProjectKey: noteProjectKeyInput,
           noteProjectKeys: noteTypeOptions,
         }),
       });
       const data = await readJsonResponse(res, '保存路径接口返回了非 JSON 响应，请检查后端服务');
       if (!res.ok) throw new Error(data.error || '保存路径失败');
-      setActiveConfig({ ...data, manualStatuses: {} });
+      const referenceCompare = normalizeReferenceCompareConfig(data.referenceCompare);
+      setActiveConfig({ ...data, referenceCompare, manualStatuses: {} });
+      setReferenceCompareEnabled(referenceCompare.enabled);
+      setReferenceCompareRootInput(referenceCompare.rootDir);
+      setReferenceCompareMonthInput(referenceCompare.month);
       setNoteProjectKeyInput(data.noteProjectKey || '');
       setNoteTypeOptions(data.noteProjectKeys || []);
       await fetchHeaderNote(data);
@@ -2454,10 +2667,17 @@ export default function App() {
       <PathConfigSection
         sourceDirInput={sourceDirInput}
         projectDirInput={projectDirInput}
+        referenceCompareEnabled={referenceCompareEnabled}
+        referenceCompareRootInput={referenceCompareRootInput}
+        referenceCompareMonthInput={referenceCompareMonthInput}
+        referenceCompareReport={referenceCompareReport}
         activeConfig={activeConfig}
         configSaving={configSaving}
         onSourceChange={(e) => setSourceDirInput(e.target.value)}
         onProjectChange={(e) => setProjectDirInput(e.target.value)}
+        onReferenceCompareEnabledChange={(e) => setReferenceCompareEnabled(e.target.checked)}
+        onReferenceCompareRootChange={(e) => setReferenceCompareRootInput(e.target.value)}
+        onReferenceCompareMonthChange={(e) => setReferenceCompareMonthInput(e.target.value)}
         onSave={handleSaveConfig}
       />
       <NoteTypeManagerModal
@@ -2491,7 +2711,9 @@ export default function App() {
         <FileSidebar
           filter={filter}
           visibleCount={visibleCount}
+          manualReviewCount={manualReviewCount}
           dangerCount={dangerCount}
+          warningCount={warningCount}
           updateCount={updateCount}
           searchTerm={searchTerm}
           onFilterChange={setFilter}
@@ -2523,8 +2745,23 @@ export default function App() {
                   <h3 className="text-sm font-bold text-white flex items-center gap-2 break-all">
                     {selectedDisplay.path}
                     {selectedDisplay.status === 'danger' && <ShieldAlert size={16} className="text-red-500 shrink-0" />}
+                    {selectedDisplay.status === 'warning' && <ShieldAlert size={16} className="text-amber-300 shrink-0" />}
                   </h3>
-                  <p className={`text-xs mt-1 ${selectedDisplay.status === 'danger' ? 'text-red-400 font-medium' : 'text-slate-400'}`}>{selectedDisplay.reason}</p>
+                  <p className={`text-xs mt-1 ${selectedDisplay.status === 'danger' ? 'text-red-400 font-medium' : selectedDisplay.status === 'warning' ? 'text-amber-300 font-medium' : 'text-slate-400'}`}>{selectedDisplay.reason}</p>
+                  {selectedDisplay.referenceInfo && (
+                    <div className="mt-2 flex flex-wrap gap-2 text-[11px]">
+                      {selectedDisplay.referenceInfo.customDiffs?.map((item, index) => (
+                        <span key={`custom-${item.month}-${index}`} className="rounded border border-amber-500/25 bg-amber-500/10 px-2 py-1 text-amber-200">
+                          {item.month} 客制差异: {item.pair?.join(' vs ')}
+                        </span>
+                      ))}
+                      {selectedDisplay.referenceInfo.nativeAdditions?.map((item, index) => (
+                        <span key={`native-${item.month}-${index}`} className="rounded border border-blue-500/25 bg-blue-500/10 px-2 py-1 text-blue-200">
+                          {item.month} 原生新增: {item.pair?.join(' -> ')}
+                        </span>
+                      ))}
+                    </div>
+                  )}
                 </div>
                 <div className="flex flex-col items-end gap-2 shrink-0">
                   <DetailActionButtons
@@ -2583,14 +2820,14 @@ export default function App() {
                   />
                 )}
 
-                <div className={`p-4 rounded-xl flex items-center justify-between border-2 shrink-0 ${selectedDisplay.status === 'danger' ? 'bg-red-500/5 border-red-500/20' : selectedDisplay.status === 'safe' ? 'bg-red-500/5 border-red-500/20' : 'bg-green-500/5 border-green-500/20'}`}>
+                <div className={`p-4 rounded-xl flex items-center justify-between border-2 shrink-0 ${selectedDisplay.status === 'danger' ? 'bg-red-500/5 border-red-500/20' : selectedDisplay.status === 'warning' ? 'bg-amber-500/5 border-amber-500/20' : selectedDisplay.status === 'safe' ? 'bg-red-500/5 border-red-500/20' : 'bg-green-500/5 border-green-500/20'}`}>
                   <div className="flex items-center gap-4">
-                    <div className={`p-2 rounded-full ${selectedDisplay.status === 'danger' ? 'bg-red-500/20' : selectedDisplay.status === 'safe' ? 'bg-red-500/20' : 'bg-green-500/20'}`}>
-                      {selectedDisplay.status === 'danger' ? <XCircle className="text-red-500" size={24} /> : <CheckCircle2 className={`${selectedDisplay.status === 'safe' ? 'text-red-400' : 'text-green-500'}`} size={24} />}
+                    <div className={`p-2 rounded-full ${selectedDisplay.status === 'danger' ? 'bg-red-500/20' : selectedDisplay.status === 'warning' ? 'bg-amber-500/20' : selectedDisplay.status === 'safe' ? 'bg-red-500/20' : 'bg-green-500/20'}`}>
+                      {selectedDisplay.status === 'danger' ? <XCircle className="text-red-500" size={24} /> : selectedDisplay.status === 'warning' ? <ShieldAlert className="text-amber-300" size={24} /> : <CheckCircle2 className={`${selectedDisplay.status === 'safe' ? 'text-red-400' : 'text-green-500'}`} size={24} />}
                     </div>
                     <div>
-                      <h4 className={`text-sm font-bold ${selectedDisplay.status === 'danger' ? 'text-red-400' : selectedDisplay.status === 'safe' ? 'text-red-300' : 'text-green-400'}`}>
-                        {selectedDisplay.status === 'danger' ? '当前文件处于人工接入状态' : selectedDisplay.status === 'safe' ? '当前规则判定为无需自动合入' : '当前文件处于 Ready 状态'}
+                      <h4 className={`text-sm font-bold ${selectedDisplay.status === 'danger' ? 'text-red-400' : selectedDisplay.status === 'warning' ? 'text-amber-300' : selectedDisplay.status === 'safe' ? 'text-red-300' : 'text-green-400'}`}>
+                        {selectedDisplay.status === 'danger' ? '当前文件处于人工接入状态' : selectedDisplay.status === 'warning' ? '当前文件命中客制化参考，禁止自动覆盖' : selectedDisplay.status === 'safe' ? '当前规则判定为无需自动合入' : '当前文件处于 Ready 状态'}
                       </h4>
                     </div>
                   </div>
@@ -2666,7 +2903,7 @@ export default function App() {
         />
       </CompareFullscreenOverlay>
 
-      <AppFooter visibleCount={visibleCount} sameCount={sameCount} dangerCount={dangerCount} updateCount={updateCount} />
+      <AppFooter visibleCount={visibleCount} sameCount={sameCount} dangerCount={dangerCount} warningCount={warningCount} updateCount={updateCount} />
 
       <style dangerouslySetInnerHTML={{ __html: `
         .custom-scrollbar::-webkit-scrollbar { width: 6px; height: 6px; }

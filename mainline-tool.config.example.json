@@ -5,5 +5,10 @@
   "noteProjectKeys": [
     "gms-mainline-shared"
   ],
+  "referenceCompare": {
+    "enabled": false,
+    "rootDir": "/path/to/reference-root",
+    "month": "2026-05"
+  },
   "manualStatuses": {}
 }
