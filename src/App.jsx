@@ -122,6 +122,10 @@ function getStatusBadgeClass(status) {
   return 'bg-green-500/20 text-green-400';
 }
 
+function getNativeReferenceHitCount(item) {
+  return item?.referenceInfo?.nativeAdditions?.length || 0;
+}
+
 function normalizeReferenceLine(line = '') {
   return (line.endsWith('\r') ? line.slice(0, -1) : line).trim();
 }
@@ -189,6 +193,10 @@ function consumeReferenceLineMatch(counts, row) {
   return null;
 }
 
+function rowMatchesReferenceLine(row, line) {
+  return getReferenceCandidateLines(row).includes(line);
+}
+
 function isDiffRow(row) {
   return row?.type === 'added' || row?.type === 'changed' || row?.type === 'removed';
 }
@@ -251,13 +259,85 @@ function findMirrorReferenceRow(rows, sourceIndex, line, mirrorTypes, highlighte
   return bestIndex;
 }
 
+function findReferenceBlockRows(rows, block, types, highlightedRows) {
+  if (block.length === 0) {
+    return null;
+  }
+
+  for (let startIndex = 0; startIndex < rows.length; startIndex += 1) {
+    if (
+      highlightedRows.has(startIndex)
+      || !types.includes(rows[startIndex].type)
+      || !rowMatchesReferenceLine(rows[startIndex], block[0])
+    ) {
+      continue;
+    }
+
+    const matchedRows = [startIndex];
+    let cursor = startIndex + 1;
+    let failed = false;
+
+    for (let blockIndex = 1; blockIndex < block.length; blockIndex += 1) {
+      while (cursor < rows.length && (highlightedRows.has(cursor) || isBlankDiffRow(rows[cursor]))) {
+        cursor += 1;
+      }
+
+      if (
+        cursor >= rows.length
+        || !types.includes(rows[cursor].type)
+        || !rowMatchesReferenceLine(rows[cursor], block[blockIndex])
+      ) {
+        failed = true;
+        break;
+      }
+
+      matchedRows.push(cursor);
+      cursor += 1;
+    }
+
+    if (!failed && matchedRows.length === block.length) {
+      return matchedRows;
+    }
+  }
+
+  return null;
+}
+
+function addReferenceBlockHighlight(rows, matchedRows, block, mirrorTypes, highlightedRows) {
+  matchedRows.forEach((rowIndex, blockIndex) => {
+    const matchedLine = block[blockIndex];
+    highlightedRows.add(rowIndex);
+    const mirrorIndex = findMirrorReferenceRow(rows, rowIndex, matchedLine, mirrorTypes, highlightedRows);
+    if (mirrorIndex !== null) {
+      highlightedRows.add(mirrorIndex);
+    }
+  });
+}
+
 function buildNativeReferenceHighlightRows(rows = [], blocks = [], preferredTypes = [], mirrorTypes = []) {
-  const counts = buildReferenceLineCounts(blocks);
+  let unmatchedBlocks = blocks;
   const highlightedRows = new Set();
 
-  if (counts.size === 0) {
+  if (blocks.length === 0) {
     return highlightedRows;
   }
+
+  const matchBlocksByType = (types) => {
+    unmatchedBlocks = unmatchedBlocks.filter((block) => {
+      const matchedRows = findReferenceBlockRows(rows, block, types, highlightedRows);
+      if (!matchedRows) {
+        return true;
+      }
+
+      addReferenceBlockHighlight(rows, matchedRows, block, mirrorTypes, highlightedRows);
+      return false;
+    });
+  };
+
+  matchBlocksByType(preferredTypes);
+  matchBlocksByType(['added', 'changed', 'removed'].filter((type) => !preferredTypes.includes(type)));
+
+  const counts = buildReferenceLineCounts(unmatchedBlocks);
 
   const matchRowsByType = (types) => {
     rows.forEach((row, index) => {
@@ -1559,7 +1639,17 @@ function FileSidebar({
                 <div className="flex items-start gap-3">
                   <div className="mt-1">{file.type === 'bin' ? <FileDigit size={16} className="text-orange-400" /> : <FileCode size={16} className="text-blue-400" />}</div>
                   <div className="flex-1 min-w-0">
-                    <p className={`text-[13px] font-medium truncate ${selectedFile?.id === file.id ? 'text-blue-400' : 'text-slate-300'}`}>{file.path.split('/').pop()}</p>
+                    <div className="flex items-center gap-2 min-w-0">
+                      <p className={`min-w-0 flex-1 text-[13px] font-medium truncate ${selectedFile?.id === file.id ? 'text-blue-400' : 'text-slate-300'}`}>{file.path.split('/').pop()}</p>
+                      {getNativeReferenceHitCount(file) > 0 && (
+                        <span
+                          title={`当前命中原生差异 ${getNativeReferenceHitCount(file)} 处，文件内有黄色内容`}
+                          className="shrink-0 rounded border border-amber-400/30 bg-amber-400/10 px-1.5 py-0.5 text-[9px] font-bold text-amber-200"
+                        >
+                          原生差异
+                        </span>
+                      )}
+                    </div>
                     <p className="text-[10px] text-slate-500 truncate mt-0.5">{file.path}</p>
                     <div className="flex items-center gap-2 mt-2">
                       <span className={`text-[9px] px-1.5 py-0.5 rounded-sm font-bold uppercase tracking-wider ${getStatusBadgeClass(file.status)}`}>
