@@ -723,6 +723,51 @@ function splitContentLines(content = '') {
   return content === '' ? [] : content.split(/\r?\n/);
 }
 
+function normalizeReferenceBlock(block = []) {
+  return block
+    .map((line) => line.trim())
+    .filter(Boolean);
+}
+
+function blockContainsSequence(containerBlock = [], candidateBlock = []) {
+  const container = normalizeReferenceBlock(containerBlock);
+  const candidate = normalizeReferenceBlock(candidateBlock);
+
+  if (candidate.length === 0 || container.length < candidate.length) {
+    return false;
+  }
+
+  for (let start = 0; start <= container.length - candidate.length; start += 1) {
+    const matched = candidate.every((line, offset) => container[start + offset] === line);
+    if (matched) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function hasMatchingReferenceBlock(currentBlocks = [], referenceBlocks = []) {
+  return referenceBlocks.some((referenceBlock) => (
+    currentBlocks.some((currentBlock) => blockContainsSequence(currentBlock, referenceBlock))
+  ));
+}
+
+function hasVisibleNativeReferenceDiff(sourceContent = '', targetContent = '', referenceInfo = null) {
+  const nativeReferences = referenceInfo?.nativeAdditions || [];
+  if (nativeReferences.length === 0 || sourceContent === targetContent) {
+    return false;
+  }
+
+  const currentAddedBlocks = getAddedLineBlocks(targetContent, sourceContent);
+  const currentRemovedBlocks = getRemovedLineBlocks(targetContent, sourceContent);
+
+  return nativeReferences.some((reference) => (
+    hasMatchingReferenceBlock(currentAddedBlocks, reference.addedLineBlocks || [])
+    || hasMatchingReferenceBlock(currentRemovedBlocks, reference.removedLineBlocks || [])
+  ));
+}
+
 function compareReferenceDirectories(leftDir, rightDir) {
   const leftFiles = new Set(getReferenceTextFiles(leftDir));
   const rightFiles = new Set(getReferenceTextFiles(rightDir));
@@ -1777,6 +1822,11 @@ app.get('/api/scan', async (req, res) => {
         reason: summary.reason,
         manualStatus: summary.manualStatus,
         referenceInfo: summary.referenceInfo,
+        nativeReferenceVisible: hasVisibleNativeReferenceDiff(
+          summary.sourceContent,
+          summary.targetContent,
+          summary.referenceInfo
+        ),
         sourceContent: summary.sourceContent.slice(0, PREVIEW_LIMIT),
         targetContent: summary.targetContent.slice(0, PREVIEW_LIMIT),
         targetExists: summary.targetExists,
@@ -1792,7 +1842,7 @@ app.get('/api/scan', async (req, res) => {
       (item.referenceInfo?.customDiffs || []).length > 0
     )).length;
     referenceCompare.report.nativeAdditionMatchedCount = results.filter((item) => (
-      (item.referenceInfo?.nativeAdditions || []).length > 0
+      item.nativeReferenceVisible
     )).length;
     referenceCompare.report.customDiffWarningCount = results.filter((item) => (
       item.status === 'warning' && (item.referenceInfo?.customDiffs || []).length > 0
@@ -1911,6 +1961,11 @@ app.post('/api/file-content/save', async (req, res) => {
         reason: summary.reason,
         manualStatus: summary.manualStatus,
         referenceInfo: summary.referenceInfo,
+        nativeReferenceVisible: hasVisibleNativeReferenceDiff(
+          summary.sourceContent,
+          summary.targetContent,
+          summary.referenceInfo
+        ),
         sourceContent: summary.sourceContent.slice(0, PREVIEW_LIMIT),
         targetContent: summary.targetContent.slice(0, PREVIEW_LIMIT),
         targetExists: summary.targetExists,

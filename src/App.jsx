@@ -123,6 +123,10 @@ function getStatusBadgeClass(status) {
 }
 
 function getNativeReferenceHitCount(item) {
+  if (!item?.nativeReferenceVisible) {
+    return 0;
+  }
+
   return item?.referenceInfo?.nativeAdditions?.length || 0;
 }
 
@@ -2957,14 +2961,14 @@ export default function App() {
                     {selectedDisplay.status === 'warning' && <ShieldAlert size={16} className="text-amber-300 shrink-0" />}
                   </h3>
                   <p className={`text-xs mt-1 ${selectedDisplay.status === 'danger' ? 'text-red-400 font-medium' : selectedDisplay.status === 'warning' ? 'text-amber-300 font-medium' : 'text-slate-400'}`}>{selectedDisplay.reason}</p>
-                  {selectedDisplay.referenceInfo && selectedDisplay.status !== 'danger' && (
+                  {selectedDisplay.referenceInfo && (selectedDisplay.status !== 'danger' || getNativeReferenceHitCount(selectedDisplay) > 0) && (
                     <div className="mt-2 flex flex-wrap gap-2 text-[11px]">
                       {selectedDisplay.status === 'warning' && selectedDisplay.referenceInfo.customDiffs?.map((item, index) => (
                         <span key={`custom-${item.month}-${index}`} className="rounded border border-amber-500/25 bg-amber-500/10 px-2 py-1 text-amber-200">
                           {item.month} 客制差异: {item.pair?.join(' vs ')}
                         </span>
                       ))}
-                      {selectedDisplay.referenceInfo.nativeAdditions?.map((item, index) => (
+                      {getNativeReferenceHitCount(selectedDisplay) > 0 && selectedDisplay.referenceInfo.nativeAdditions?.map((item, index) => (
                         <span key={`native-${item.month}-${index}`} className="rounded border border-blue-500/25 bg-blue-500/10 px-2 py-1 text-blue-200">
                           {item.month} 原生差异: {item.pair?.join(' -> ')}
                         </span>
